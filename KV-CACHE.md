@@ -59,6 +59,8 @@ BONSAI_BIN_DIR=bin/cuda-e8 BONSAI_KV=rk4v4-e8 ./scripts/start_llama_server.sh
 
 `build_cuda_linux.sh` clones `PrismML-Eng/llama.cpp` (branch `prism`) into `./llama.cpp` if it is not there; pass `--repo-url` / `--branch` to point it somewhere else. Windows has no fork build script yet, so the `.ps1` launcher accepts `rk4v4` only.
 
+To move the result to another machine, `./scripts/make_portable_bundle.sh` packs the binaries, the CUDA runtime and the sources into an archive that runs with just the NVIDIA driver — see [PORTABLE.md](PORTABLE.md).
+
 ## Better quality for `rk4v4`: the mean-centering bias
 
 4-bit quantization of the K cache loses a little accuracy on channels whose activations have a nonzero mean. A small **model-specific calibration bias** fixes most of that at zero decode-time cost (one subtract when the cache is written). Build it once:

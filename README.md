@@ -457,6 +457,7 @@ Bonsai-demo/
 ├── VISION.md                       # Image input: costs, caps, OCR tips
 ├── SPECULATIVE.md                  # Speculative decoding (experimental)
 ├── KV-CACHE.md                     # Compressed KV cache presets (experimental)
+├── PORTABLE.md                     # Pack a movable, driver-only copy of the demo
 ├── AGENTS.md                       # Agent guide (hardware tuning knobs)
 ├── setup.sh                        # macOS/Linux setup
 ├── setup.ps1                       # Windows setup
