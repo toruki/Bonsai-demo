@@ -110,7 +110,7 @@ pq2_0_ready_backend() {
 backend_from_bin() {
     case "$1" in
         */bin/mac/*)    echo mac ;;
-        */bin/cuda/*)   echo cuda ;;
+        */bin/cuda/*|*/bin/cuda-*/*)   echo cuda ;;
         */bin/rocm/*)   echo rocm ;;
         */bin/hip/*)    echo hip ;;
         */bin/vulkan/*) echo vulkan ;;

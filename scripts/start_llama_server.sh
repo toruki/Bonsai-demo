@@ -26,7 +26,8 @@ fi
 # BONSAI_LLAMA_BIN=/path/to/dir overrides the search (a prebuilt PrismML-fork build elsewhere on disk).
 BIN=""
 [ -n "${BONSAI_LLAMA_BIN:-}" ] && [ -f "$BONSAI_LLAMA_BIN/llama-server" ] && BIN="$BONSAI_LLAMA_BIN/llama-server"
-for _d in bin/mac bin/cuda bin/rocm bin/hip bin/vulkan bin/cpu llama.cpp/build/bin llama.cpp/build-mac/bin llama.cpp/build-cuda/bin; do
+# BONSAI_BIN_DIR forces a specific directory (e.g. bin/cuda-e8 for a locally built fork).
+for _d in ${BONSAI_BIN_DIR:+"$BONSAI_BIN_DIR"} bin/mac bin/cuda bin/cuda-e8 bin/rocm bin/hip bin/vulkan bin/cpu llama.cpp/build/bin llama.cpp/build-mac/bin llama.cpp/build-cuda/bin; do
     [ -n "$BIN" ] && break
     [ -f "$DEMO_DIR/$_d/llama-server" ] && BIN="$DEMO_DIR/$_d/llama-server" && break
 done
@@ -163,27 +164,63 @@ if [ "$_full_profile" = "1" ]; then
         fi
     fi
 
-    # 4-bit KV cache (opt-in, BONSAI_KV4=1): stores the KV cache in Q4_0 to cut
-    # KV memory for very long contexts on tight machines (decode is slightly
-    # slower than F16 KV). If a mean-centering bias built by
-    # scripts/make_kv_bias.sh is present it is applied automatically for
-    # better quality.
+    # Compressed KV cache (opt-in, BONSAI_KV=<preset>): trades a little decode speed
+    # for a much smaller KV cache at very long contexts. Per token on the 27B
+    # (16 attention layers x 4 KV heads x 256 dims):
+    #
+    #   (unset)    f16    / f16     64 KiB   default, no flags passed
+    #   rk8v4      q8_0   / q4_0    26 KiB   fork build only
+    #   rk4v4      q4_0   / q4_0    18 KiB   == the old BONSAI_KV4=1
+    #   rk4v4-e8   q4_0_e8/ q4_0    18 KiB   E8-lattice K codes, fork build only
+    #   rk2v4-e8   q2_e8  / q4_0    13.5 KiB max capacity, fork build only
+    #
+    # Quantized KV needs flash attention, which the exec below always enables. The
+    # Hadamard K/V rotation llama.cpp applies to quantized caches is what makes the
+    # E8 presets worthwhile, so they are incompatible with the mean-centering bias
+    # (which is calibrated with that rotation off) -- only rk4v4 picks a bias up.
     _kv_args=""
     KV_BIAS=""
-    if [ "${BONSAI_KV4:-0}" = "1" ]; then
-        _kv_args="--cache-type-k q4_0 --cache-type-v q4_0"
-        for _kb in "$GGUF_MODEL_DIR"/*kv-bias*.gguf; do
-            [ -f "$_kb" ] || continue
-            case "$_kb" in /*) KV_BIAS="$_kb" ;; *) KV_BIAS="$DEMO_DIR/$_kb" ;; esac
-            break
-        done
+    _kv="${BONSAI_KV:-}"
+    if [ -z "$_kv" ] && [ "${BONSAI_KV4:-0}" = "1" ]; then
+        _kv="rk4v4"   # backwards-compatible alias
+    fi
+    if [ -n "$_kv" ]; then
+        case "$_kv" in
+            rk8v4)    _ctk=q8_0;    _ctv=q4_0 ;;
+            rk4v4)    _ctk=q4_0;    _ctv=q4_0 ;;
+            rk4v4-e8) _ctk=q4_0_e8; _ctv=q4_0 ;;
+            rk2v4-e8) _ctk=q2_e8;   _ctv=q4_0 ;;
+            *)  err "BONSAI_KV: unknown preset '$_kv' (expected rk8v4, rk4v4, rk4v4-e8 or rk2v4-e8)"
+                exit 1 ;;
+        esac
+
+        # The published binaries only carry q4_0/q4_0; every other preset needs the
+        # E8 fork build, which is also the build that allows a K type != the V type.
+        if [ "$_kv" != "rk4v4" ] && ! "$BIN" --help 2>&1 | grep -q 'q4_0_e8'; then
+            err "BONSAI_KV=$_kv needs the E8 fork build ($BIN does not support it)."
+            echo "  Build it once:  ./scripts/build_cuda_linux.sh --output cuda-e8"
+            echo "  Then run with:  BONSAI_BIN_DIR=bin/cuda-e8 BONSAI_KV=$_kv ./scripts/start_llama_server.sh"
+            exit 1
+        fi
+
+        _kv_args="--cache-type-k $_ctk --cache-type-v $_ctv"
+
+        if [ "$_kv" = "rk4v4" ]; then
+            for _kb in "$GGUF_MODEL_DIR"/*kv-bias*.gguf; do
+                [ -f "$_kb" ] || continue
+                case "$_kb" in /*) KV_BIAS="$_kb" ;; *) KV_BIAS="$DEMO_DIR/$_kb" ;; esac
+                break
+            done
+        fi
         if [ -n "$KV_BIAS" ]; then
             # The bias is calibrated with K-rotation off; inference must match
             # (the loader rejects a mismatch by design).
             export LLAMA_ATTN_ROT_DISABLE=1
-            echo "  KV cache: q4_0 + mean-centering ($(basename "$KV_BIAS"))"
+            echo "  KV cache: $_kv ($_ctk/$_ctv) + mean-centering ($(basename "$KV_BIAS"))"
+        elif [ "$_kv" = "rk4v4" ]; then
+            echo "  KV cache: $_kv ($_ctk/$_ctv) (no bias; run ./scripts/make_kv_bias.sh for better quality)"
         else
-            echo "  KV cache: q4_0 (no bias; run ./scripts/make_kv_bias.sh for better quality)"
+            echo "  KV cache: $_kv ($_ctk/$_ctv)"
         fi
     fi
 

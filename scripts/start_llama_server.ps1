@@ -37,7 +37,7 @@ try {
 } catch {}
 
 # Captured unconditionally: the finally block at the end restores it on every
-# launch, not just the ones where the KV4 bias block below sets it.
+# launch, not just the ones where the KV bias block below sets it.
 $priorRotDisable = $env:LLAMA_ATTN_ROT_DISABLE
 
 if ($BonsaiFamily -eq "bonsai2") {
@@ -196,15 +196,36 @@ if ($BonsaiModel -eq "27B") {
             Write-Host "       Convert the downloaded bf16 drafter once (see SPECULATIVE.md, section 'Converting the published drafter')." -ForegroundColor Yellow
         }
     }
-    # 4-bit KV cache (opt-in, BONSAI_KV4=1): stores the KV cache in Q4_0 to cut
-    # KV memory for very long contexts on tight machines (decode is slightly
-    # slower than F16 KV). If a mean-centering bias built by
-    # scripts/make_kv_bias.sh is present it is applied automatically for
-    # better quality. Mirrors start_llama_server.sh.
+    # Compressed KV cache (opt-in, BONSAI_KV=<preset>): trades a little decode speed
+    # for a much smaller KV cache at very long contexts. Per token on the 27B:
+    #   (unset)  f16/f16 64 KiB | rk8v4 q8_0/q4_0 26 KiB | rk4v4 q4_0/q4_0 18 KiB
+    #   rk4v4-e8 q4_0_e8/q4_0 18 KiB | rk2v4-e8 q2_e8/q4_0 13.5 KiB
+    # Everything except rk4v4 needs the E8 fork build, which is Linux-only today
+    # (there is no Windows build script for it). Mirrors start_llama_server.sh.
     $KvArgs = @()
-    if ($env:BONSAI_KV4 -eq "1") {
-        $KvArgs = @("--cache-type-k", "q4_0", "--cache-type-v", "q4_0")
-        $KvBias = Get-ChildItem -Path $ModelDir -Filter *kv-bias*.gguf -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    $Kv = $env:BONSAI_KV
+    if (-not $Kv -and $env:BONSAI_KV4 -eq "1") { $Kv = "rk4v4" }  # backwards-compatible alias
+    if ($Kv) {
+        switch ($Kv) {
+            "rk8v4"    { $Ctk = "q8_0";    $Ctv = "q4_0" }
+            "rk4v4"    { $Ctk = "q4_0";    $Ctv = "q4_0" }
+            "rk4v4-e8" { $Ctk = "q4_0_e8"; $Ctv = "q4_0" }
+            "rk2v4-e8" { $Ctk = "q2_e8";   $Ctv = "q4_0" }
+            default {
+                Write-Host "[ERROR] BONSAI_KV: unknown preset '$Kv' (expected rk8v4, rk4v4, rk4v4-e8 or rk2v4-e8)" -ForegroundColor Red
+                exit 1
+            }
+        }
+        if ($Kv -ne "rk4v4" -and -not ((& $Bin --help 2>&1) -match "q4_0_e8")) {
+            Write-Host "[ERROR] BONSAI_KV=$Kv needs the E8 fork build, which $Bin does not support." -ForegroundColor Red
+            Write-Host "        The fork currently has a Linux build script only (scripts/build_cuda_linux.sh --output cuda-e8)." -ForegroundColor Yellow
+            exit 1
+        }
+        $KvArgs = @("--cache-type-k", $Ctk, "--cache-type-v", $Ctv)
+        $KvBias = $null
+        if ($Kv -eq "rk4v4") {
+            $KvBias = Get-ChildItem -Path $ModelDir -Filter *kv-bias*.gguf -File -ErrorAction SilentlyContinue | Select-Object -First 1
+        }
         if ($KvBias) {
             # The bias is calibrated with K-rotation off; inference must match
             # (the loader rejects a mismatch by design). The finally block below
@@ -213,9 +234,11 @@ if ($BonsaiModel -eq "27B") {
             # leave this set for later launches).
             $env:LLAMA_ATTN_ROT_DISABLE = "1"
             $KvArgs += @("--kv-mean-center", $KvBias.FullName)
-            Write-Host "  KV cache: q4_0 + mean-centering ($($KvBias.Name))" -ForegroundColor Green
+            Write-Host "  KV cache: $Kv ($Ctk/$Ctv) + mean-centering ($($KvBias.Name))" -ForegroundColor Green
+        } elseif ($Kv -eq "rk4v4") {
+            Write-Host "  KV cache: $Kv ($Ctk/$Ctv) (no bias; run scripts/make_kv_bias.sh for better quality)" -ForegroundColor Green
         } else {
-            Write-Host "  KV cache: q4_0 (no bias; run scripts/make_kv_bias.sh for better quality)" -ForegroundColor Green
+            Write-Host "  KV cache: $Kv ($Ctk/$Ctv)" -ForegroundColor Green
         }
     }
     $ServerArgs = @(
@@ -259,7 +282,7 @@ try {
     & $Bin @ServerArgs @args
     $code = $LASTEXITCODE
 } finally {
-    # Don't leak the KV4 bias flag into the parent PowerShell session.
+    # Don't leak the KV bias flag into the parent PowerShell session.
     if ($null -eq $priorRotDisable) {
         Remove-Item Env:LLAMA_ATTN_ROT_DISABLE -ErrorAction SilentlyContinue
     } else {

@@ -169,7 +169,7 @@ Every launcher is configured through environment variables. The most common ones
 | `BONSAI_NGL` | auto-detect | int; `0` = CPU-only | GPU layer offload. |
 | `BONSAI_CTX` | auto (RAM-tiered) | `0`, or ≤ `262144` | Context length (`0`/unset = automatic safe size). |
 | `BONSAI_HOST` | `127.0.0.1` | any bind address | Server bind address. A non-loopback value exposes the server — see the security note in the full reference. |
-| `BONSAI_KV4` | `0` | `1` | 4-bit KV cache for long contexts ([KV-CACHE.md](KV-CACHE.md)). |
+| `BONSAI_KV` | unset | `rk4v4`, `rk4v4-e8`, `rk2v4-e8`, `rk8v4` | Compressed KV cache for long contexts ([KV-CACHE.md](KV-CACHE.md)); `BONSAI_KV4=1` is an alias for `rk4v4`. |
 
 **Full reference** — all 24 variables (model/setup, server, MLX, Open WebUI, tools, and platform coverage): **[environment_variables.md](environment_variables.md)**.
 
@@ -308,7 +308,7 @@ Upload images in the chat UI (`+` in the message box) or send `image_url` parts 
 
 Optional features for the llama.cpp chat server:
 
-- **4-bit KV cache**: `BONSAI_KV4=1` cuts KV-cache memory roughly 3.5x for very long contexts, with an optional calibration bias for better quality (`./scripts/make_kv_bias.sh`). Details: [KV-CACHE.md](KV-CACHE.md).
+- **Compressed KV cache**: `BONSAI_KV=rk4v4` cuts KV-cache memory roughly 3.5x for very long contexts, with an optional calibration bias for better quality (`./scripts/make_kv_bias.sh`). The E8-lattice presets `rk4v4-e8` and `rk2v4-e8` (the latter down to 13.5 KiB/token) need a locally built fork. Details: [KV-CACHE.md](KV-CACHE.md).
 - **Vision projector in RAM**: `BONSAI_MMPROJ_CPU=1` keeps the 27B's vision projector in system RAM instead of VRAM (`--no-mmproj-offload`), freeing VRAM for KV/context on tight cards. The cost is a slower image prompt (the projector runs on CPU); text-only chat is unaffected.
 
 ### Context Size
@@ -317,7 +317,7 @@ Bonsai 2 27B supports up to **262,144 tokens** of context. The FP16 KV cache cos
 
 The launch scripts pick a **default context sized to your machine's RAM**, from 8K on small machines up to 131K for the 27B on machines with more than 71 GB (roughly 0.5 to 8 GiB of KV cache), so memory use stays predictable. Override with the `BONSAI_CTX` environment variable: pass any number up to 262144, or `0` (the same as leaving it unset) for the automatic RAM-tiered size. To force the model's full training context, pass the explicit number (e.g. `BONSAI_CTX=262144`) — only recommended on machines with plenty of headroom, since the scripts will not silently do this for you.
 
-With the optional [4-bit KV cache](KV-CACHE.md) (`BONSAI_KV4=1`) the cache drops to roughly 18 KiB per token, about **1.8 GiB at 100K**, saving roughly 4.5 GiB of KV memory. Total memory also depends on the model packing, runtime buffers, and vision projector.
+With the optional [compressed KV cache](KV-CACHE.md) (`BONSAI_KV=rk4v4`) the cache drops to roughly 18 KiB per token, about **1.8 GiB at 100K**, saving roughly 4.5 GiB of KV memory. Total memory also depends on the model packing, runtime buffers, and vision projector. `BONSAI_KV=rk2v4-e8` (locally built E8 fork) goes further still, to 13.5 KiB per token (~1.35 GiB at 100K).
 
 Extra arguments pass straight through to llama.cpp, so `./scripts/run_llama.sh -c 8192 -p "Your prompt"` also works for a one-off context override.
 
@@ -456,7 +456,7 @@ Bonsai-demo/
 ├── OPENWEBUI.md                    # Open WebUI agentic demo guide
 ├── VISION.md                       # Image input: costs, caps, OCR tips
 ├── SPECULATIVE.md                  # Speculative decoding (experimental)
-├── KV-CACHE.md                     # 4-bit KV cache (experimental)
+├── KV-CACHE.md                     # Compressed KV cache presets (experimental)
 ├── AGENTS.md                       # Agent guide (hardware tuning knobs)
 ├── setup.sh                        # macOS/Linux setup
 ├── setup.ps1                       # Windows setup
