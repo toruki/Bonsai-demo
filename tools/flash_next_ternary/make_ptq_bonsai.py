@@ -124,7 +124,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True, help="base HF checkpoint dir")
     ap.add_argument("--dst", required=True, help="output HF-layout dir")
-    ap.add_argument("--rule", choices=["absmean", "mseopt"], required=True)
+    ap.add_argument("--rule", choices=["absmean", "mseopt", "none"], required=True,
+                    help="none = fold only (F16, no ternary): control for the fold/runtime path")
     ap.add_argument("--signs-from", default=str(HERE.parents[1] / "models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-PQ2_0.gguf"))
     ap.add_argument("--only-shards", nargs="*", default=None, help="process only these shard files (testing)")
     ap.add_argument("--threads", type=int, default=16)
@@ -136,7 +137,7 @@ def main() -> None:
 
     signs = shipped_signs(Path(a.signs_from))
     h = torch.from_numpy(hadamard_matrix(BLOCK))
-    quant = {"absmean": ternary_absmean, "mseopt": ternary_mseopt}[a.rule]
+    quant = {"absmean": ternary_absmean, "mseopt": ternary_mseopt, "none": lambda x: x}[a.rule]
 
     index = json.load(open(src / "model.safetensors.index.json"))
     shards = sorted(set(index["weight_map"].values()))

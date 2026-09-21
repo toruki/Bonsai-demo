@@ -23,8 +23,11 @@ step "base download complete: $(du -sh $BASE | cut -f1)"
 
 # 0b. shipped Bonsai 2 in PTQ1_0 packing (content-identical to the local PQ2_0; same kernel family as B)
 if [[ ! -f $GG/shipped-bonsai2-27b-PTQ1_0.gguf ]]; then
-  step "downloading shipped PTQ1_0"
-  $PY -c "from huggingface_hub import hf_hub_download as h; import shutil; p=h('prism-ml/Ternary-Bonsai-2-27B-gguf','Ternary-Bonsai-2-27B-PTQ1_0.gguf'); shutil.copy(p,'$GG/shipped-bonsai2-27b-PTQ1_0.gguf')" >> $LOG 2>&1 || step "shipped PTQ1_0 download FAILED (will use local PQ2_0)"
+  step "downloading shipped PTQ1_0 (curl, resumable)"
+  curl -sL -C - --retry 10 --retry-delay 10 -o $GG/shipped-bonsai2-27b-PTQ1_0.gguf.part \
+    "https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main/Ternary-Bonsai-2-27B-PTQ1_0.gguf" \
+    && mv $GG/shipped-bonsai2-27b-PTQ1_0.gguf.part $GG/shipped-bonsai2-27b-PTQ1_0.gguf \
+    || step "shipped PTQ1_0 download FAILED (will use local PQ2_0)"
 fi
 
 # 1. BF16 reference GGUF
