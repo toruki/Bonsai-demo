@@ -58,12 +58,17 @@ int main(int argc, char ** argv) {
     dump_state st;
     st.filter = std::regex("^(l_out-[0-9]+|result_norm|result_output)$");
     st.outdir = "hidden_dump";
+    int n_chunks = 0, chunk_len = 512;
+    bool save_logits = true;
 
     // strip our own options before handing the rest to common_params_parse
     std::vector<char *> args;
     for (int i = 0; i < argc; ++i) {
         if (!strcmp(argv[i], "--dump-dir") && i + 1 < argc) { st.outdir = argv[++i]; continue; }
         if (!strcmp(argv[i], "--dump-filter") && i + 1 < argc) { st.filter = std::regex(argv[++i]); continue; }
+        if (!strcmp(argv[i], "--n-chunks") && i + 1 < argc) { n_chunks = atoi(argv[++i]); continue; }
+        if (!strcmp(argv[i], "--chunk-len") && i + 1 < argc) { chunk_len = atoi(argv[++i]); continue; }
+        if (!strcmp(argv[i], "--no-logits")) { save_logits = false; continue; }
         args.push_back(argv[i]);
     }
     if (!common_params_parse((int) args.size(), args.data(), params, LLAMA_EXAMPLE_COMMON)) {
@@ -83,34 +88,49 @@ int main(int argc, char ** argv) {
     if (!model || !ctx) { LOG_ERR("init failed\n"); return 1; }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
-    std::vector<llama_token> toks = common_tokenize(ctx, params.prompt, llama_vocab_get_add_bos(vocab), true);
-    if ((int) toks.size() > params.n_ctx) toks.resize(params.n_ctx);
-    LOG_INF("n_tokens = %zu\n", toks.size());
+    std::vector<llama_token> all = common_tokenize(ctx, params.prompt, llama_vocab_get_add_bos(vocab), true);
+    // chunk mode: split the corpus into n_chunks independent sequences of chunk_len tokens
+    // (memory cleared between them); single-prompt mode is n_chunks = 1, chunk_len = n_ctx
+    std::vector<std::vector<llama_token>> seqs;
+    if (n_chunks > 0) {
+        for (int c = 0; c < n_chunks && (size_t) (c + 1) * chunk_len <= all.size(); ++c) {
+            seqs.emplace_back(all.begin() + (size_t) c * chunk_len, all.begin() + (size_t) (c + 1) * chunk_len);
+        }
+    } else {
+        if ((int) all.size() > params.n_ctx) all.resize(params.n_ctx);
+        seqs.push_back(all);
+    }
+    LOG_INF("n_sequences = %zu, tokens/seq = %zu\n", seqs.size(), seqs.empty() ? 0 : seqs[0].size());
 
     std::string mk = "mkdir -p '" + st.outdir + "'";
     if (system(mk.c_str()) != 0) { LOG_ERR("mkdir failed\n"); return 1; }
     // fresh files
     for (auto & kv : st.shapes) { (void) kv; }
 
-    // request logits for every token so result_output covers the whole prompt
-    llama_batch batch = llama_batch_init((int) toks.size(), 0, 1);
-    for (size_t i = 0; i < toks.size(); ++i) {
-        common_batch_add(batch, toks[i], (llama_pos) i, {0}, true);
-    }
-    if (llama_decode(ctx, batch)) { LOG_ERR("decode failed\n"); return 1; }
-
-    // also write the logits from the API (same as result_output but guaranteed full)
-    {
-        const int n_vocab = llama_vocab_n_tokens(vocab);
-        std::ofstream f(st.outdir + "/logits.f32", std::ios::binary);
-        for (size_t i = 0; i < toks.size(); ++i) {
-            const float * l = llama_get_logits_ith(ctx, (int) i);
-            f.write((const char *) l, sizeof(float) * n_vocab);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    std::ofstream lf(st.outdir + "/logits.f32", std::ios::binary);
+    std::vector<llama_token> toks;                  // concatenated token stream for meta
+    for (size_t si = 0; si < seqs.size(); ++si) {
+        const auto & sq = seqs[si];
+        llama_memory_clear(llama_get_memory(ctx), true);
+        llama_batch batch = llama_batch_init((int) sq.size(), 0, 1);
+        for (size_t i = 0; i < sq.size(); ++i) {
+            common_batch_add(batch, sq[i], (llama_pos) i, {0}, save_logits);
         }
-        st.shapes["logits"] = {n_vocab, (int64_t) toks.size(), 1, 1};
+        if (llama_decode(ctx, batch)) { LOG_ERR("decode failed on seq %zu\n", si); return 1; }
+        if (save_logits) {
+            for (size_t i = 0; i < sq.size(); ++i) {
+                const float * l = llama_get_logits_ith(ctx, (int) i);
+                lf.write((const char *) l, sizeof(float) * n_vocab);
+            }
+        }
+        toks.insert(toks.end(), sq.begin(), sq.end());
+        llama_batch_free(batch);
+        if (si % 10 == 9) LOG_INF("  %zu / %zu sequences\n", si + 1, seqs.size());
     }
+    if (save_logits) st.shapes["logits"] = {n_vocab, (int64_t) toks.size(), 1, 1};
     std::ofstream meta(st.outdir + "/meta.json");
-    meta << "{\n  \"n_tokens\": " << toks.size() << ",\n  \"tokens\": [";
+    meta << "{\n  \"n_tokens\": " << toks.size() << ",\n  \"n_sequences\": " << seqs.size() << ",\n  \"seq_len\": " << (seqs.empty() ? 0 : seqs[0].size()) << ",\n  \"tokens\": [";
     for (size_t i = 0; i < toks.size(); ++i) meta << (i ? "," : "") << toks[i];
     meta << "],\n  \"tensors\": {";
     bool first = true;
@@ -120,7 +140,6 @@ int main(int argc, char ** argv) {
     }
     meta << "\n  }\n}\n";
     LOG_INF("dumped %zu tensors to %s\n", st.shapes.size(), st.outdir.c_str());
-    llama_batch_free(batch);
     llama_backend_free();
     return 0;
 }
