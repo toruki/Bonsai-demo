@@ -10,6 +10,7 @@ Qwen3.8-Flash-Next へ Bonsai 2 風の ternary 量子化を適用できるかを
 | `fetch_slice.py` | HF safetensors から必要な tensor(行スライス)だけ HTTP Range 取得。キャッシュは `/data/models/flash-next-bf16-slices` |
 | `ternary_quant.py` | group-wise ternary 量子化 4 方式(A: absmean / B: MSE scale / C: threshold grid / D: 交互反復) |
 | `run_phase3.py` | 単一 tensor の測定ハーネス |
+| `bonsai_reverse.py` | 出荷 Bonsai 2 の code/scale を base Qwen3.8-27B と要素対応させ、fold 規約・threshold・scale を逆算 |
 
 ## 使い方
 
@@ -22,4 +23,8 @@ python tools/flash_next_ternary/run_phase3.py --part gate --expert 0
 python tools/flash_next_ternary/run_phase3.py --part down --expert 0 --blocks 0 128
 ```
 
-結果と考察は `docs/phase3_ternary_experiment.md`。
+```bash
+python tools/flash_next_ternary/bonsai_reverse.py --layer 0 --tensor 'blk.{l}.ffn_gate.weight' --rows 1024
+```
+
+結果と考察は `docs/phase3_ternary_experiment.md` と `docs/bonsai_reverse_analysis.md`。

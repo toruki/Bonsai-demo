@@ -95,7 +95,7 @@ expert 間のばらつきは 0.4% 以内。**expert 個別の最適化は不要*
 
 ## 4. 読み取れたこと
 
-### 4-1. PTQ ternary は理論限界に到達しており、これ以上は改善しません
+### 4-1. この制約下の PTQ ternary は最適点に到達しており、同じ枠内では改善しません
 
 N(0,1) に対する最適 ternary 量子化を解析的に解くと:
 
@@ -106,9 +106,17 @@ rel_mse = 0.19017   cosine = 0.8999   threshold = 0.6120 σ   scale = 1.2240 σ 
 実測(C / D)は **rel_mse 0.1866–0.1872 / zero率 45.6–45.8%** で、
 group-128 の適応 scale のぶんだけ解析値をわずかに下回っています。
 
-つまり **B ≈ C ≈ D はすべて同じ最適点に収束しており、
+つまり **B ≈ C ≈ D は同じ最適点に収束しており、同じ枠内で
 「もっと良い threshold / scale optimizer」を探しても意味がありません。**
 A(absmean)だけが 0.26 と劣りますが、これは MSE を最適化していないため当然です。
+
+ただしこの「最適」は次の制約をすべて固定した上での話です:
+固定 Hadamard(block 128/512)、group 128、group 内共通 scale、
+{-1,0,+1}、**目的関数 = weight MSE**。
+以下を許せば改善余地は残っています(未検証):
+activation-aware な目的関数、GPTQ/Hessian 系の誤差補償、group 間・column 間の補正、
+learned rotation / permutation、tensor ごとの Hadamard block、一部 channel の高 bit 化、
+ternary 化後の短時間 fine-tune / QAT。特に **weight MSE 最小 ≠ 推論誤差最小** です。
 
 routed expert の重みは kurtosis ≈ 3.5(= ほぼ Gaussian)で、
 **Gaussian は回転不変なので Hadamard の効果も小さい**(0.208 → 0.187、約 10% 改善)。
