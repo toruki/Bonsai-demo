@@ -74,7 +74,7 @@ def main():
     ap.add_argument("--cos-weight", type=float, default=1.0)
     ap.add_argument("--freeze-codes", action="store_true", help="train scales+norms only (control)")
     ap.add_argument("--eval-every", type=int, default=100)
-    ap.add_argument("--train-dir", default="/data/eval/act_train")
+    ap.add_argument("--train-dir", default="/data/eval/act_train", help="comma-separated dump dirs")
     ap.add_argument("--valid-dir", default="/data/eval/act_valid")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
@@ -87,7 +87,9 @@ def main():
     log = {"args": vars(a)}
 
     # ---- data (BF16 residual stream from llama.cpp dumps)
-    xtr, ytr = load_acts(Path(a.train_dir), f"l_out-{L-1}"), load_acts(Path(a.train_dir), f"l_out-{L}")
+    tdirs = [Path(d) for d in a.train_dir.split(",")]
+    xtr = torch.cat([load_acts(d, f"l_out-{L-1}") for d in tdirs])
+    ytr = torch.cat([load_acts(d, f"l_out-{L}") for d in tdirs])
     xva, yva = load_acts(Path(a.valid_dir), f"l_out-{L-1}"), load_acts(Path(a.valid_dir), f"l_out-{L}")
     print(f"train {tuple(xtr.shape)}  valid {tuple(xva.shape)}")
 
@@ -188,6 +190,8 @@ def main():
     log["history"] = hist
     log["final"] = hist[-1] if hist else None
     torch.save({n: student.get_submodule(n).codes().cpu() for n in init_codes}, out_dir / "codes.pt")
+    torch.save({k: v.detach().cpu() for k, v in student.state_dict().items() if not k.endswith((".H", ".signs"))},
+               out_dir / "student_state.pt")
     torch.save({n: student.get_submodule(n).scale.detach().cpu() for n in init_codes}, out_dir / "scales.pt")
     (out_dir / "log.json").write_text(json.dumps(log, indent=1))
     print("wrote", out_dir)

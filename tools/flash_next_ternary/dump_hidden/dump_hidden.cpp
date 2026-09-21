@@ -58,7 +58,7 @@ int main(int argc, char ** argv) {
     dump_state st;
     st.filter = std::regex("^(l_out-[0-9]+|result_norm|result_output)$");
     st.outdir = "hidden_dump";
-    int n_chunks = 0, chunk_len = 512;
+    int n_chunks = 0, chunk_len = 512, chunk_offset = 0;
     bool save_logits = true;
 
     // strip our own options before handing the rest to common_params_parse
@@ -68,6 +68,7 @@ int main(int argc, char ** argv) {
         if (!strcmp(argv[i], "--dump-filter") && i + 1 < argc) { st.filter = std::regex(argv[++i]); continue; }
         if (!strcmp(argv[i], "--n-chunks") && i + 1 < argc) { n_chunks = atoi(argv[++i]); continue; }
         if (!strcmp(argv[i], "--chunk-len") && i + 1 < argc) { chunk_len = atoi(argv[++i]); continue; }
+        if (!strcmp(argv[i], "--chunk-offset") && i + 1 < argc) { chunk_offset = atoi(argv[++i]); continue; }
         if (!strcmp(argv[i], "--no-logits")) { save_logits = false; continue; }
         args.push_back(argv[i]);
     }
@@ -93,7 +94,7 @@ int main(int argc, char ** argv) {
     // (memory cleared between them); single-prompt mode is n_chunks = 1, chunk_len = n_ctx
     std::vector<std::vector<llama_token>> seqs;
     if (n_chunks > 0) {
-        for (int c = 0; c < n_chunks && (size_t) (c + 1) * chunk_len <= all.size(); ++c) {
+        for (int c = chunk_offset; c < chunk_offset + n_chunks && (size_t) (c + 1) * chunk_len <= all.size(); ++c) {
             seqs.emplace_back(all.begin() + (size_t) c * chunk_len, all.begin() + (size_t) (c + 1) * chunk_len);
         }
     } else {

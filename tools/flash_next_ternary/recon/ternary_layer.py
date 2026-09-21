@@ -92,8 +92,9 @@ class TernaryLinear(nn.Module):
         n_out, n_in = weight.shape
         assert n_in % BLOCK == 0 and n_in % GROUP == 0
         self.n_out, self.n_in = n_out, n_in
-        self.register_buffer("signs", signs.to(torch.float32))
-        self.register_buffer("H", torch.from_numpy(hadamard_matrix(BLOCK)))
+        dev = weight.device
+        self.register_buffer("signs", signs.to(device=dev, dtype=torch.float32))
+        self.register_buffer("H", torch.from_numpy(hadamard_matrix(BLOCK)).to(dev))
         # latent weight lives in the *primal* basis (what a checkpoint would store);
         # folding happens in forward so the rotation stays exactly the runtime's
         self.weight = nn.Parameter(weight.to(torch.float32).clone())
@@ -108,8 +109,8 @@ class TernaryLinear(nn.Module):
     def from_folded(cls, wf: torch.Tensor, signs: torch.Tensor) -> "TernaryLinear":
         """Build from an already-folded ternary weight (e.g. the shipped GGUF): the latent
         is the unfolded weight, and the amax scale reproduces the codes exactly."""
-        H = torch.from_numpy(hadamard_matrix(BLOCK)).to(wf.dtype)
-        w = ((wf.reshape(-1, BLOCK) @ H).reshape(wf.shape)) * signs.to(wf.dtype)
+        H = torch.from_numpy(hadamard_matrix(BLOCK)).to(device=wf.device, dtype=wf.dtype)
+        w = ((wf.reshape(-1, BLOCK) @ H).reshape(wf.shape)) * signs.to(device=wf.device, dtype=wf.dtype)
         return cls(w, signs, init="amax")
 
     def fold(self, w: torch.Tensor) -> torch.Tensor:
