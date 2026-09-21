@@ -31,11 +31,18 @@ from ternary_layer import (TERNARY_LINEARS, TernaryLinear, build_layer, layer_fo
                            load_layer_weights, recon_metrics, shipped_layer_weights, ternarize_layer)
 
 
+USE_CKPT = False
+
+
 def block_forward(layers, x, cfg, return_all=False):
     outs = []
     h = x
     for mod in layers:
-        h = layer_forward(mod, h, cfg)
+        if USE_CKPT and torch.is_grad_enabled():
+            import torch.utils.checkpoint as ck
+            h = ck.checkpoint(lambda inp, m=mod: layer_forward(m, inp, cfg), h, use_reentrant=False)
+        else:
+            h = layer_forward(mod, h, cfg)
         outs.append(h)
     return (h, outs) if return_all else h
 
@@ -75,6 +82,7 @@ def main():
     ap.add_argument("--cos-weight", type=float, default=1.0)
     ap.add_argument("--aux", type=float, default=0.0, help="weight of intermediate-exit losses")
     ap.add_argument("--optim", default="adamw", choices=["adamw", "sgd"])
+    ap.add_argument("--ckpt", action="store_true", help="gradient checkpointing per layer")
     ap.add_argument("--eval-every", type=int, default=100)
     ap.add_argument("--train-dir", default="/data/eval/act_train")
     ap.add_argument("--valid-dir", default="/data/eval/act_valid")
@@ -82,6 +90,8 @@ def main():
     a = ap.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.manual_seed(0)
+    global USE_CKPT
+    USE_CKPT = a.ckpt
     L0, L1 = a.first, a.last
     nl = L1 - L0 + 1
     out_dir = Path(a.out or f"/data/eval/block_L{L0}-{L1}_{a.init}")

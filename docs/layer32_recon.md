@@ -82,3 +82,58 @@ gate 0.807 / up 0.821 / down 0.777。MLP 側、特に down_proj が最も動く�
 - 640 seq で run A を再実行(過学習の切り分け)。
 - `train_block.py` で layer 32–35 を block として学習(入力は BF16 l_out-31、目標は BF16 l_out-35、
   中間 exit の補助 loss は任意)。4 層 fp32 + AdamW で ~25 GB。
+
+---
+
+# 追記: 640 seq での再実行、4 層 block 学習、mixed モデルの PPL
+
+## 5. layer 32 単層、640 seq(1500 step、lr 2e-4)
+
+| | delta cos | delta relMSE | code 変化 | 出荷 code 一致 |
+|---|---:|---:|---:|---:|
+| 160 seq / 600 step(run A) | 0.882 | 0.225 | 14.5 % | 82.2 % |
+| **640 seq / 1500 step** | **0.896** | **0.198** | 19.4 % | 79.1 % |
+
+train 0.23 / valid 0.27(step 500)と過学習ギャップは縮小。終端でもまだ改善中で、
+データ量と学習長の両方が効く。
+
+## 6. 4 層 block(layer 32–35、入力 BF16 `l_out-31`、目標 BF16 `l_out-35`、640 seq、1500 step)
+
+学生 4 層は逐次に流す(下流層は上流 ternary 層の誤差込みの出力を受ける)。
+gradient checkpointing あり、bs 2、ピーク 29.9 GB、0.7 s/step。
+
+| 4 層 block | delta cos | delta relMSE | full cos |
+|---|---:|---:|---:|
+| PTQ-mseopt(学習前) | 0.718 | 0.482 | 0.9449 |
+| 出荷 Bonsai 2 の 4 層 | 0.790 | 0.379 | 0.9573 |
+| **block 学習後** | **0.899** | **0.193** | **0.9780** |
+
+- 単層より出荷との差が開く(0.747→0.790 vs PTQ 0.727→0.718)= 出荷の層同士は協調している。
+- block 学習は 250 step で出荷 4 層を超え、最終的に relMSE を 2.5 分の 1 にした。
+- code 変化 15.3 %、出荷 code 一致 80.7 %。
+
+## 7. mixed モデルの PPL(④): 該当 4 層だけ ternary、残り 60 層は BF16
+
+`export_mixed.py` で学習済み層(folded ternary × fp16 scale を F16 で格納、manifest はその 25 tensor のみ)を
+base checkpoint に差し込み、fork の converter → F16 GGUF → `llama-perplexity`。
+値は ternary × fp16 scale なので F16 でも PTQ1_0 と数値的に同一。
+
+| モデル(layer 32–35 のみ ternary) | wikitext PPL (64 chunk) | Mean KLD† | top-1 一致† |
+|---|---:|---:|---:|
+| BF16(参照) | 6.513 | — | — |
+| 4 層 = PTQ-mseopt | 6.735 (+3.4 %) | 0.0593 | 88.9 % |
+| **4 層 = block 学習後** | **6.618 (+1.6 %)** | **0.0332** | **91.5 %** |
+
+† BF16 logits 基準、16 chunk。
+
+**4 層ぶんの ternary 化コストを KL で 0.059 → 0.033(44 % 減)、PPL 増分で 3.4 % → 1.6 % に半減。**
+これは 1 block あたり 18 分の学習と 640 seq × 512 token(33 万 token)で得た値。
+
+## 8. ここから全体へ
+
+- 全 64 層で PTQ の KL は 5.1(block あたり 0.059 の単純和 0.95 を大きく超える = 超線形に累積)。
+  同じ累積が block 学習後(0.033/block)にも起きるとすれば、全体を独立に学習しても出荷(0.37)には届かない。
+- したがって **progressive**(block b の学生入力を、学習済み block 0..b−1 の *学生* 出力にする)が必須。
+  各 block の学習は「上流の ternary 誤差を含んだ入力」で行われ、累積を直接学習できる。
+- 見積もり: 16 block × (活性生成 ~1 分 + 学習 ~18 分) ≈ **5–6 時間**、完全自動化可能。
+  出力は完全な ternary 27B(PTQ1_0 GGUF)で、出荷 Bonsai 2 と PPL / KL を直接比較できる。
