@@ -207,6 +207,8 @@ def main():
     ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument("--init", default="mseopt")
     ap.add_argument("--sanity-dir", default=None, help="llama.cpp dump dir (valid) with l_out-K to check the canonical stream")
+    ap.add_argument("--compact", action="store_true", help="save codes+scales+norms instead of full latent states")
+    ap.add_argument("--keep-streams", action="store_true", help="keep every boundary's f16 streams on disk")
     a = ap.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.manual_seed(0)
@@ -264,10 +266,28 @@ def main():
         print(f"  EXIT layer {b1}: student stream vs canonical: cos {fin['cos_mean']:.5f} relMSE {fin['rel_mse']:.4f}", flush=True)
         blog["exit_stream_vsC"] = fin
         for k, m in zip(ks, layers):
-            torch.save({kk: v.detach().cpu() for kk, v in m.state_dict().items() if not kk.endswith((".H", ".signs"))},
-                       out / f"student_state_L{k}.pt")
+            if a.compact:
+                # ternary codes (int8, folded basis) + scales + norms: all an export needs, ~0.4 GB/layer
+                sd = {}
+                for n in TERNARY_LINEARS:
+                    try:
+                        tl = m.get_submodule(n)
+                    except AttributeError:
+                        continue
+                    if isinstance(tl, TernaryLinear):
+                        sd[n + ".codes"] = tl.codes().cpu(); sd[n + ".scale"] = tl.scale.detach().cpu()
+                for kk, v in m.named_parameters():
+                    if "norm" in kk:
+                        sd[kk] = v.detach().cpu()
+                torch.save(sd, out / f"student_compact_L{k}.pt")
+            else:
+                torch.save({kk: v.detach().cpu() for kk, v in m.state_dict().items() if not kk.endswith((".H", ".signs"))},
+                           out / f"student_state_L{k}.pt")
         save_f16(S_tr, out / f"S_{b1+1}_train.f16"); save_f16(S_va, out / f"S_{b1+1}_valid.f16")
         save_f16(C_tr, out / f"C_{b1+1}_train.f16"); save_f16(C_va, out / f"C_{b1+1}_valid.f16")
+        if not a.keep_streams:
+            for f in out.glob(f"[SC]_{b0}_*"):
+                f.unlink()
         log["blocks"][f"{b0}-{b1}"] = blog
         json.dump(log, open(log_path, "w"), indent=1)
         del layers, A_exit_tr, A_int_tr, A_exit_va, A_int_va; torch.cuda.empty_cache()

@@ -42,14 +42,21 @@ def main():
         prefix = f"model.language_model.layers.{k}."
         mod, _ = build_layer(k, load_layer_weights(k), device="cpu")
         mod = ternarize_layer(mod, init=a.ptq or "mseopt")
+        compact = None
         if a.states:
-            p = Path(a.states) / f"student_state_L{k}.pt"
-            if not p.exists():
-                p = Path(a.states) / "student_state.pt"
-            sd = torch.load(p)
-            missing, unexpected = mod.load_state_dict(sd, strict=False)
-            assert not unexpected, unexpected
-            print(f"layer {k}: loaded {len(sd)} tensors from {p}")
+            p = Path(a.states) / f"student_compact_L{k}.pt"
+            if p.exists():
+                compact = torch.load(p)
+                mod.load_state_dict({kk: v for kk, v in compact.items() if "norm" in kk}, strict=False)
+                print(f"layer {k}: loaded compact codes/scales/norms from {p}")
+            else:
+                p = Path(a.states) / f"student_state_L{k}.pt"
+                if not p.exists():
+                    p = Path(a.states) / "student_state.pt"
+                sd = torch.load(p)
+                missing, unexpected = mod.load_state_dict(sd, strict=False)
+                assert not unexpected, unexpected
+                print(f"layer {k}: loaded {len(sd)} tensors from {p}")
         with torch.no_grad():
             for n in TERNARY_LINEARS:
                 try:
@@ -58,7 +65,11 @@ def main():
                     continue
                 if not isinstance(tl, TernaryLinear):
                     continue
-                wq = tl.quantized_weight()                       # folded ternary * fp16 scale, exact in F16
+                if compact is not None:
+                    c = compact[n + ".codes"].float().reshape(-1, GROUP); sc = compact[n + ".scale"].float().reshape(-1, 1)
+                    wq = (c * sc).reshape(tl.n_out, tl.n_in)
+                else:
+                    wq = tl.quantized_weight()                   # folded ternary * fp16 scale, exact in F16
                 repl[prefix + n + ".weight"] = wq.to(torch.float16).contiguous()
                 entries.append({"name": prefix + n + ".weight", "axis": -1, "role": "fold-before-matmul"})
             for n, p in mod.named_parameters():
