@@ -40,7 +40,7 @@ driver: `/data/eval/prog_full_dual2.sh`、成果物: `/data/models/gguf/progress
 | **progressive dual** | **64 層**(embed / head BF16) | **11.07** | **1.70** | **0.736** | **65.9 %** |
 | 出荷 Bonsai 2 | 64 層 + embed + head | 8.62 | 1.32 | 0.367 | 75.2 % |
 
-PTQ1_0 に pack した GGUF(6.6 GB、embed / head は BF16)は fork の runtime でそのまま動き、
+PTQ1_0 に pack した GGUF(10.6 GB = ternary 層 5.5 GB + BF16 の embed/head 5.1 GB)は fork の runtime でそのまま動き(GPU 全載せ、64 chunk 21 秒)、
 F16 版と同じ PPL(§4)。
 
 ## 3. 層別 hidden 比較(固定 prompt 1082 token、BF16 基準、cos / relMSE)

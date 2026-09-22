@@ -223,7 +223,16 @@ def main():
         S_tr = embed(tok_tr); S_va = embed(tok_va); C_tr, C_va = S_tr.clone(), S_va.clone()
     else:
         S_tr, S_va = load_f16(out / f"S_{a.first}_train.f16"), load_f16(out / f"S_{a.first}_valid.f16")
-        C_tr, C_va = load_f16(out / f"C_{a.first}_train.f16"), load_f16(out / f"C_{a.first}_valid.f16")
+        if (out / f"C_{a.first}_train.f16").exists():
+            C_tr, C_va = load_f16(out / f"C_{a.first}_train.f16"), load_f16(out / f"C_{a.first}_valid.f16")
+        else:
+            # canonical stream was cleaned up: recompute it from the embeddings through BF16 layers 0..first-1
+            print(f"recomputing canonical stream through BF16 layers 0..{a.first-1}", flush=True)
+            C_tr, C_va = embed(tok_tr), embed(tok_va)
+            for k0 in range(0, a.first, 8):
+                teachers = [build_layer(k, load_layer_weights(k))[0].eval() for k in range(k0, min(k0 + 8, a.first))]
+                C_tr = run_layers(teachers, C_tr, rotary); C_va = run_layers(teachers, C_va, rotary)
+                del teachers; torch.cuda.empty_cache()
     print(f"streams: train {tuple(S_tr.shape)} valid {tuple(S_va.shape)}  (f16 in RAM)")
 
     for b0 in range(a.first, a.last + 1, a.block):
