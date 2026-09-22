@@ -31,6 +31,7 @@ def main():
     ap.add_argument("--states", default=None, help="dir with student_state_L{k}.pt (block) or student_state.pt (single)")
     ap.add_argument("--ptq", default=None, choices=["mseopt", "absmean"])
     ap.add_argument("--dst", required=True)
+    ap.add_argument("--head-params", default=None, help="head_params.pt from head_calib/train_joint: merges norm, in_scale, LoRA into lm_head")
     a = ap.parse_args()
     assert (a.states is None) != (a.ptq is None), "give --states or --ptq"
     dst = Path(a.dst); dst.mkdir(parents=True, exist_ok=True)
@@ -79,6 +80,21 @@ def main():
         tot = sum(v.numel() for kk, v in repl.items() if kk.startswith(prefix) and v.dtype == torch.float16)
         print(f"layer {k}: {tot/1e6:.0f}M ternary params, zero frac {zero/tot:.4f}")
 
+    if a.head_params:
+        from safetensors import safe_open
+        hp = torch.load(a.head_params)
+        index0 = json.load(open(BASE / "model.safetensors.index.json"))["weight_map"]
+        with safe_open(str(BASE / index0["lm_head.weight"]), "pt") as f:
+            W = f.get_tensor("lm_head.weight").float()
+        if "lora_a" in hp and hp["lora_a"] is not None:
+            W = W + hp["lora_b"].float() @ hp["lora_a"].float()
+        if "W_delta" in hp and hp["W_delta"] is not None:
+            W = W + hp["W_delta"].float()
+        W = W * hp["in_scale"].float()[None, :]
+        repl["lm_head.weight"] = W.to(torch.bfloat16).contiguous()
+        repl["model.language_model.norm.weight"] = (hp["norm"].float() - 1.0).to(torch.bfloat16).contiguous()
+        bias = hp.get("bias")
+        print(f"head merged: lora={'lora_a' in hp}, |bias|max={float(bias.abs().max()) if bias is not None else 0:.4f} (bias dropped: not representable in GGUF)")
     # shards: rewrite the ones that hold replaced tensors, symlink the rest
     index = json.load(open(BASE / "model.safetensors.index.json"))["weight_map"]
     touched = {index[n] for n in repl}

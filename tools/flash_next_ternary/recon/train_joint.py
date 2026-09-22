@@ -44,6 +44,7 @@ def main():
     ap.add_argument("--anchor", type=float, default=0.1)
     ap.add_argument("--temp", type=float, default=1.0)
     ap.add_argument("--freeze-codes", action="store_true")
+    ap.add_argument("--no-bias", action="store_true", help="no vocab bias (GGUF cannot store one)")
     ap.add_argument("--eval-every", type=int, default=100)
     ap.add_argument("--dir", default="/data/eval/prog_dual")
     ap.add_argument("--out", default=None)
@@ -92,7 +93,7 @@ def main():
     if a.head != "none":
         p_n.append(head.norm); head.norm.requires_grad_(True)
     if a.head in ("diag", "lora"):
-        p_h += [head.in_scale, head.bias]
+        p_h += [head.in_scale] + ([] if a.no_bias else [head.bias])
     if a.head == "lora":
         p_h += [head.lora_a, head.lora_b]
     for p in p_h: p.requires_grad_(True)
