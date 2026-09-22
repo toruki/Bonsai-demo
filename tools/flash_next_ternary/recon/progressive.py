@@ -59,7 +59,7 @@ class Rotary:
 
     def __call__(self, x):
         B, L, _ = x.shape
-        key = (B, L)
+        key = (B, L, x.dtype)
         if key not in self.cache:
             pos = torch.arange(L, device=x.device)[None, None, :].expand(3, B, L)
             self.cache[key] = self.rot(x, pos)
@@ -114,9 +114,44 @@ def code_agree(layers, ref):
     return sum(vals) / len(vals) if vals else float("nan")
 
 
+# ------------------------------------------------------------- suffix-aware
+
+@torch.no_grad()
+def precompute_topk(head, out: Path, k: int):
+    """Teacher top-k (indices, log-probs) per token from the canonical final stream C_64 + BF16 head."""
+    res = {}
+    for split in ("train", "valid"):
+        C = load_f16(out / f"C_64_{split}.f16")
+        idx_l, lp_l = [], []
+        for i in range(0, C.shape[0], 2):
+            lt = F.log_softmax(head(C[i:i + 2].cuda().float().reshape(-1, C.shape[-1])), -1)
+            v, ix = lt.topk(k, dim=-1)
+            idx_l.append(ix.int().cpu()); lp_l.append(v.to(torch.float16).cpu())
+        res[split] = (torch.cat(idx_l).reshape(C.shape[0], C.shape[1], k), torch.cat(lp_l).reshape(C.shape[0], C.shape[1], k))
+        print(f"  teacher top-{k} for {split}: {tuple(res[split][0].shape)}", flush=True)
+    return res
+
+
+def suffix_kl_loss(y, suffix, rotary, idx, lp, tok):
+    """y [B,L,D] student block output -> frozen bf16 suffix -> head -> restricted KL vs teacher top-k.
+    KL restricted to teacher top-k U {ground truth}: sum_i p_t(i) (log p_t(i) - log p_s(i)), both over the full vocab."""
+    import torch.utils.checkpoint as ck
+    h = y.to(torch.bfloat16)
+    for m in suffix["layers"]:
+        h = ck.checkpoint(lambda inp, m=m: fwd(m, inp, rotary), h, use_reentrant=False)
+    D = h.shape[-1]
+    ls = F.log_softmax(suffix["head"](h.reshape(-1, D).float()), -1)          # [N, V]
+    idx = idx.reshape(-1, idx.shape[-1]).cuda().long(); lp = lp.reshape(-1, lp.shape[-1]).cuda().float()
+    # include the ground-truth next token with the teacher probability mass it actually has (already in top-k usually)
+    ls_k = ls.gather(1, idx)
+    kl = (lp.exp() * (lp - ls_k)).sum(-1).mean()
+    top1 = (ls.argmax(-1) == idx[:, 0]).float().mean()
+    return kl, top1
+
+
 # -------------------------------------------------------------------- train
 
-def train_block(layers, S, A_exit, C_exit, A_int, valid, cfg, rotary, a, log):
+def train_block(layers, S, A_exit, C_exit, A_int, valid, cfg, rotary, a, log, suffix=None):
     """S/A_exit/C_exit/A_int[j]: f16 CPU tensors over train seqs; valid: dict of same for valid."""
     import torch.utils.checkpoint as ck
     USE_CKPT = True
@@ -154,6 +189,12 @@ def train_block(layers, S, A_exit, C_exit, A_int, valid, cfg, rotary, a, log):
         out = {"vsA": recon_metrics(valid["A_exit"].float() - x, y - x),
                "vsC": recon_metrics(valid["C_exit"].float() - valid["C_in"].float(), y - valid["C_in"].float()),
                "stream_vsC": recon_metrics(valid["C_exit"].float(), y)}
+        if suffix is not None:
+            vi, vl = suffix["topk"]["valid"]; kls = []; tops = []
+            for i in range(0, y.shape[0], 2):
+                kl, t1 = suffix_kl_loss(y[i:i + 2].cuda(), suffix, rotary, vi[i:i + 2], vl[i:i + 2], None)
+                kls.append(kl.item()); tops.append(float(t1))
+            out["suffix_kl"] = sum(kls) / len(kls); out["suffix_top1"] = sum(tops) / len(tops)
         for m in layers: m.train()
         return out
 
@@ -172,16 +213,21 @@ def train_block(layers, S, A_exit, C_exit, A_int, valid, cfg, rotary, a, log):
             for j in range(len(layers) - 1):
                 tj = A_int[j][idx].cuda().float()
                 laux = laux + rel(hs[j] - x, tj - x)
-        loss = lA + a.anchor * lC + a.cos_weight * lcos + a.aux * laux
+        lS = torch.zeros((), device=x.device); s_top1 = torch.zeros(())
+        if suffix is not None:
+            ti, tl = suffix["topk"]["train"]
+            lS, s_top1 = suffix_kl_loss(y, suffix, rotary, ti[idx], tl[idx], None)
+        loss = lA + a.anchor * lC + a.cos_weight * lcos + a.aux * laux + a.suffix_kl * lS
         opt.zero_grad(set_to_none=True); loss.backward()
         torch.nn.utils.clip_grad_norm_(p_w + p_s + p_n, 1.0)
         opt.step(); sched.step()
         if step % 50 == 0:
-            print(f"    step {step:5d} loss {loss.item():.4f} A {lA.item():.4f} C {lC.item():.4f} cos {lcos.item():.4f} aux {laux.item():.4f} ({time.time()-t0:.0f}s)", flush=True)
+            print(f"    step {step:5d} loss {loss.item():.4f} A {lA.item():.4f} C {lC.item():.4f} cos {lcos.item():.4f} aux {laux.item():.4f} sufKL {lS.item():.4f} top1 {float(s_top1):.3f} ({time.time()-t0:.0f}s) mem {torch.cuda.max_memory_allocated()/2**30:.1f}G", flush=True)
         if step % a.eval_every == 0 or step == a.steps:
             ev = evaluate(); hist.append({"step": step, **ev})
             print(f"    [eval {step}] delta vsA cos {ev['vsA']['cos_mean']:.4f} relMSE {ev['vsA']['rel_mse']:.4f} | "
-                  f"delta vsC cos {ev['vsC']['cos_mean']:.4f} relMSE {ev['vsC']['rel_mse']:.4f} | stream vsC cos {ev['stream_vsC']['cos_mean']:.5f} relMSE {ev['stream_vsC']['rel_mse']:.4f}", flush=True)
+                  f"delta vsC cos {ev['vsC']['cos_mean']:.4f} relMSE {ev['vsC']['rel_mse']:.4f} | stream vsC cos {ev['stream_vsC']['cos_mean']:.5f} relMSE {ev['stream_vsC']['rel_mse']:.4f}"
+                  + (f" | suffix KL {ev['suffix_kl']:.4f} top1 {ev['suffix_top1']:.3f}" if 'suffix_kl' in ev else ""), flush=True)
     log["train_history"] = hist
     for p in p_w + p_s + p_n: p.requires_grad_(False)
     del opt
@@ -208,6 +254,10 @@ def main():
     ap.add_argument("--init", default="mseopt")
     ap.add_argument("--sanity-dir", default=None, help="llama.cpp dump dir (valid) with l_out-K to check the canonical stream")
     ap.add_argument("--compact", action="store_true", help="save codes+scales+norms instead of full latent states")
+    ap.add_argument("--suffix-kl", type=float, default=0.0,
+                    help="weight of the suffix-aware loss: student block output -> frozen BF16 layers b1+1..63 -> head, top-k KL vs teacher logits")
+    ap.add_argument("--topk", type=int, default=256)
+    ap.add_argument("--suffix-max", type=int, default=16, help="refuse suffixes longer than this (GPU memory)")
     ap.add_argument("--keep-streams", action="store_true", help="keep every boundary's f16 streams on disk")
     a = ap.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -258,15 +308,38 @@ def main():
                 blog["sanity_vs_llamacpp"] = m
         del teachers; torch.cuda.empty_cache()
 
+        # suffix-aware: frozen BF16 layers after the block + BF16 head, teacher top-k logits from C_64
+        suffix = None
+        if a.suffix_kl > 0:
+            n_suf = 63 - b1
+            if n_suf > a.suffix_max:
+                raise RuntimeError(f"suffix of {n_suf} layers exceeds --suffix-max {a.suffix_max}")
+            from head_calib import bf16_head
+            suf_layers = [build_layer(k, load_layer_weights(k), dtype=torch.bfloat16)[0].eval() for k in range(b1 + 1, 64)]
+            for m in suf_layers:
+                for p in m.parameters(): p.requires_grad_(False)
+            head = bf16_head()
+            for p in head.parameters(): p.requires_grad_(False)
+            if "teacher_topk" not in globals() or teacher_topk is None:
+                globals()["teacher_topk"] = precompute_topk(head, out, a.topk)
+            suffix = {"layers": suf_layers, "head": head, "topk": teacher_topk, "tok_tr": tok_tr, "tok_va": tok_va}
+            print(f"  suffix-aware: {n_suf} frozen BF16 layers + head, top-{a.topk} KL, lambda {a.suffix_kl}", flush=True)
         # student
         layers = [ternarize_layer(build_layer(k, load_layer_weights(k))[0], init=a.init) for k in ks]
         valid = {"S": S_va, "A_exit": A_exit_va, "C_exit": C_exit_va, "C_in": C_va}
         m0 = {"stream_vsC": recon_metrics(C_exit_va.float(), run_layers(layers, S_va, rotary).float()),
               "vsA": None}
+        if suffix is not None:
+            with torch.no_grad():
+                y0 = run_layers(layers, S_va, rotary); vi, vl = suffix["topk"]["valid"]; kls = []
+                for i in range(0, y0.shape[0], 2):
+                    kls.append(suffix_kl_loss(y0[i:i + 2].cuda().float(), suffix, rotary, vi[i:i + 2], vl[i:i + 2], None)[0].item())
+                m0["suffix_kl"] = sum(kls) / len(kls)
+                print(f"  INIT suffix KL (valid) {m0['suffix_kl']:.4f}", flush=True)
         print(f"  INIT stream vsC: cos {m0['stream_vsC']['cos_mean']:.5f} relMSE {m0['stream_vsC']['rel_mse']:.4f}", flush=True)
         blog["init"] = m0
         if a.steps > 0:
-            train_block(layers, S_tr, A_exit_tr, C_exit_tr, A_int_tr, valid, cfg, rotary, a, blog)
+            train_block(layers, S_tr, A_exit_tr, C_exit_tr, A_int_tr, valid, cfg, rotary, a, blog, suffix=suffix)
         # advance streams
         for m in layers: m.eval()
         S_tr = run_layers(layers, S_tr, rotary); S_va = run_layers(layers, S_va, rotary)
@@ -299,7 +372,7 @@ def main():
                 f.unlink()
         log["blocks"][f"{b0}-{b1}"] = blog
         json.dump(log, open(log_path, "w"), indent=1)
-        del layers, A_exit_tr, A_int_tr, A_exit_va, A_int_va; torch.cuda.empty_cache()
+        del layers, A_exit_tr, A_int_tr, A_exit_va, A_int_va, suffix; torch.cuda.empty_cache()
     print("PROGRESSIVE DONE", out)
 
 
