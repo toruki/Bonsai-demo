@@ -17,6 +17,7 @@ group scales and the two hyper-connection norms (AdamW).
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import sys
@@ -311,6 +312,8 @@ def main():
                     ev = evaluate()
                     print(f"    [eval {step}] delta vsA relMSE {ev['delta_vsA']:.4f} | stream vsC relMSE {ev['stream_vsC']:.4f}", flush=True)
             ex.opt = None
+            # the last step's graph (loss -> ... -> TernaryMoE ctx) holds the optimizer state
+            del loss, lA, lC, lcos, y, d, x, yA, yC, opt_s
             e1 = evaluate(); ll["trained"] = {k: v for k, v in e1.items() if k != "Y"}
         else:
             e1 = e0
@@ -325,7 +328,9 @@ def main():
         print(f"  EXIT layer {L}: stream vs canonical relMSE {ll['exit_stream_vsC']:.4f}  zero {ll['zero_frac']:.3f}  ({time.time()-t0:.0f}s)", flush=True)
         log["layers"][str(L)] = ll
         json.dump(log, open(out / "log.json", "w"), indent=1)
-        del student, ex, scl, A_tr, A_va; torch.cuda.empty_cache()
+        del student, ex, scl, nrm, A_tr, A_va, e0, e1; gc.collect(); torch.cuda.empty_cache()
+        print(f"  (layer end: allocated {torch.cuda.memory_allocated()/2**30:.2f}G)", flush=True)
+        torch.cuda.reset_peak_memory_stats()
     print("Q4X PROGRESSIVE DONE", flush=True)
 
 
