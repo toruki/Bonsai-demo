@@ -13,7 +13,9 @@ Weights can also come from a BF16 HuggingFace checkpoint instead of the GGUF its
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import time
 import sys
 from pathlib import Path
 
@@ -131,35 +133,75 @@ def main() -> None:
         w.add_array("prism.hadamard.sign_widths", [int(x) for x in widths])
         w.add_array("prism.hadamard.sign_values", [int(v) for wd in widths for v in signs[wd]])
 
-    new_data: dict[str, np.ndarray] = {}
+    # two passes: sizes first (cheap), then compute + write one tensor at a time so the
+    # working set never exceeds a single tensor (a whole-model run otherwise needs ~30 GB)
+    UNQ = (GGMLQuantizationType.F32, GGMLQuantizationType.F16, GGMLQuantizationType.BF16)
+
+    def convert(t):
+        """Fold + ternarize + pack, in chunks along the outermost axis.
+
+        A whole expert tensor is 839 M params; materialising it as f32 and running the
+        sort inside `ternarize` peaks around 20 GB, which is what kept killing the process
+        on this machine. Chunking keeps the working set near 1 GB and is exact, because
+        both the fold (blockwise on the last axis) and the group-128 quantiser act
+        row-wise.
+        """
+        dims = [int(x) for x in t.shape]                  # gguf order, dims[0] = input axis
+        logical = tuple(dims[::-1])
+        inner = int(np.prod(logical[1:])) if len(logical) > 1 else 1
+        step = max(1, (1 << 28) // max(inner * 4, 1))      # ~256 MB of f32 per chunk
+        parts, err, ref, zeros, count = [], 0.0, 0.0, 0, 0
+        for s0 in range(0, logical[0], step):
+            raw = t.data[s0:s0 + step]
+            x = (raw.astype(np.float32) if t.tensor_type in UNQ else dequantize(raw, t.tensor_type))
+            x = x.reshape((-1,) + logical[1:])
+            xf = x if a.no_rotate else fold(x, a.block, signs[dims[0]])
+            del x
+            y = ternarize(xf, a.group, a.method)
+            err += float(((y - xf) ** 2).sum()); ref += float((xf ** 2).sum())
+            zeros += int((y == 0).sum()); count += y.size
+            del xf
+            parts.append(ptq1_0_quantize(y))
+            del y
+        packed = np.concatenate(parts).reshape(quant_shape_to_byte_shape(logical, GGMLQuantizationType.PTQ1_0))
+        return packed, zeros / count, err / ref
+
     for t in r.tensors:
         if a.kv_only or not targeted(t.name):
             w.add_tensor_info(t.name, t.data.shape, t.data.dtype, t.data.nbytes, t.tensor_type)
             continue
-        dims = [int(x) for x in t.shape]                  # gguf order, dims[0] = input axis
-        logical = tuple(dims[::-1])
-        x = (t.data.astype(np.float32) if t.tensor_type in (GGMLQuantizationType.F32, GGMLQuantizationType.F16, GGMLQuantizationType.BF16)
-             else dequantize(t.data, t.tensor_type)).reshape(logical)
-        xf = x if a.no_rotate else fold(x, a.block, signs[dims[0]])
-        y = ternarize(xf, a.group, a.method)
-        packed = ptq1_0_quantize(y).reshape(quant_shape_to_byte_shape(logical, GGMLQuantizationType.PTQ1_0))
-        new_data[t.name] = packed
-        zero = float((y == 0).mean())
-        rel = float(((y - xf) ** 2).sum() / (xf ** 2).sum())
-        print(f"  {t.name:34s} {t.tensor_type.name:7s} {dims} -> PTQ1_0  zero={zero:.3f} relMSE={rel:.4f}", flush=True)
-        del x, xf, y
-        w.add_tensor_info(t.name, packed.shape, packed.dtype, packed.nbytes, GGMLQuantizationType.PTQ1_0)
+        logical = tuple(int(x) for x in t.shape)[::-1]
+        bshape = quant_shape_to_byte_shape(logical, GGMLQuantizationType.PTQ1_0)
+        w.add_tensor_info(t.name, bshape, np.dtype(np.uint8), int(np.prod(bshape)), GGMLQuantizationType.PTQ1_0)
 
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_ti_data_to_file()
     total = sum(t.n_bytes for t in r.tensors)
     done = 0
+    last_sync = 0
     for i, t in enumerate(r.tensors):
-        w.write_tensor_data(new_data[t.name] if t.name in new_data else t.data, tensor_endianess=r.endianess)
+        if not a.kv_only and targeted(t.name):
+            packed, zero, rel = convert(t)
+            w.write_tensor_data(packed, tensor_endianess=r.endianess)
+            print(f"  {t.name:34s} {t.tensor_type.name:7s} {[int(x) for x in t.shape]} -> PTQ1_0  "
+                  f"zero={zero:.3f} relMSE={rel:.4f}", flush=True)
+            del packed
+        else:
+            w.write_tensor_data(t.data, tensor_endianess=r.endianess)
         done += t.n_bytes
-        if i % 25 == 0 or i + 1 == len(r.tensors):
-            print(f"  writing {i+1}/{len(r.tensors)}  {done/1e9:.1f}/{total/1e9:.1f} GB", flush=True)
+        # WSL2's virtual SCSI path runs out of swiotlb bounce buffers when the dirty page
+        # pool grows without bound, which kills the process mid-write. Flush and drop the
+        # cache for what we already wrote every few GB to keep it small.
+        if done - last_sync > 256_000_000:
+            for fo in w.fout:
+                fo.flush()
+                os.fsync(fo.fileno())
+                os.posix_fadvise(fo.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+            time.sleep(0.15)   # let the virtual storage queue drain
+            last_sync = done
+        if i % 50 == 0 or i + 1 == len(r.tensors):
+            print(f"  [{i+1}/{len(r.tensors)}] {done/1e9:.1f}/{total/1e9:.1f} GB", flush=True)
     w.close()
     print("wrote", a.dst)
 
