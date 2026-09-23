@@ -240,3 +240,87 @@ range read で取得する(27B と同じ `fetch_slice.py` の手順)。
 2. Hadamard block を tensor 単位 / tensor class 単位へ拡張し、gate/up を H512 に
    (`prism.hadamard.block_size` が現状は GGUF 全体で単一値)
 3. 全 48 層への展開と VRAM 実測
+
+---
+
+# Step 3b: 全 48 層の expert を ternary 化(規模・サイズ・VRAM の実測)
+
+## 8-1. `llama-quantize` の COPY + `--tensor-type` 修正
+
+全層を Python で処理しようとしたが、839 M params の tensor を扱う過程で WSL2 上で
+プロセスごと強制終了される事象が繰り返した(チャンク化と I/O 抑制で layer 12 → 21 → 28 → 37 と
+前進したが完走せず。`dmesg` には `hv_storvsc: swiotlb buffer is full` が出ていた)。
+C++ の `llama-quantize` に切り替えたが、**COPY ftype では `--tensor-type` の上書きが無効**だった
+(`tensor_allows_quantization` が `params->only_copy` で即 false を返す)。
+
+`src/llama-quant.cpp` に最小修正を入れ、**COPY でも明示的に名前指定された tensor だけは変換する**
+ようにした。混合精度モデルの一部 tensor だけを別の型にする唯一の手段であり、fork 本体にとっても有用。
+
+```
+llama-quantize --allow-requantize \
+  --tensor-type ffn_gate_exps=ptq1_0 --tensor-type ffn_up_exps=ptq1_0 \
+  --tensor-type ffn_down_exps=ptq1_0  src.gguf dst.gguf COPY 16
+```
+
+## 8-2. サイズ
+
+| | 元 | PTQ1_0 |
+|---|---:|---:|
+| `ffn_down_exps`(層あたり) | 450 MiB (IQ4_NL) | 175 MiB |
+| `ffn_gate_exps` / `ffn_up_exps`(層あたり各) | 256 MiB (IQ2_S) | 175 MiB |
+| **モデル全体** | **78,154 MiB (3.71 bpw)** | **56,979 MiB (2.70 bpw)** |
+
+削減 21.2 GiB(−27 %)、変換 9.5 分(16 スレッド)。
+Phase 2 の机上見積もり(routed experts 120.8 B を PTQ1_0 で 24.6 GiB)と実測(24.6 GiB)が一致。
+
+## 8-3. VRAM(RTX 5090 32 GB、`-ngl 48` = 全層オフロード、`-c 2048`)
+
+| 項目 | サイズ |
+|---|---:|
+| CUDA0 model buffer | 28,422 MiB |
+| CPU_Mapped model buffer(PLE の n-gram テーブルなど) | 28,557 MiB |
+| CUDA0 KV + RS + compute | 512 MiB |
+| **GPU 合計** | **約 28.9 GiB** |
+
+**全 48 層が 5090 に載る。** `-ngl 20/28/36/48` すべて OOM なし。
+残り 28.5 GiB は PLE(`per_layer_token_embd`, 27.5 GiB)が CPU 側に残ったもので、
+Phase 2 の設計どおり「PLE は CPU RAM へ offload」が実機で成立している。
+Phase 2 の見積もり(構成 C で 28.26 GiB)は実測 28.9 GiB とよく一致した。
+
+## 8-4. 品質(ここが問題)
+
+| モデル | 32 chunk PPL |
+|---|---:|
+| 元の UD-IQ3_XXS | 2.4783 ± 0.052 |
+| layer 0 の expert のみ ternary(**H128 + MSE 最適**) | 2.5057 ± 0.052 |
+| **全 48 層の expert ternary(fold なし・素の RTN)** | **22.275 ± 0.748** |
+
+生成自体は一貫している:
+
+```
+> The capital of Japan is
+[Start thinking]
+The user is asking about the capital of Japan. This is a straightforward factual question
+```
+
+しかし PPL は 9 倍に悪化。層あたりのコスト(+0.027)から線形に予測される 3.8 を大きく超えており、
+**27B で観測したのと同じ超線形な累積**が Flash-Next でも起きている。
+
+ただしこの比較には手法差が混じっている点に注意:
+
+| | 量子化器 | Hadamard |
+|---|---|---|
+| layer 0 版 | group-128 の MSE 最適 | H128 fold あり |
+| 全層版 | `llama-quantize` の RTN(absmax) | なし |
+
+27B の知見(`docs/ptq_vs_shipped_27b.md`)では **RTN(absmean 相当)は MSE 最適より PPL で 18 倍悪かった**。
+つまり 22.3 のうち相当部分は量子化器の差で説明できる可能性が高く、
+fold + MSE 最適 + reconstruction を入れた値とは別物として扱う必要がある。
+
+## 9. 現時点の結論
+
+- **経路は完全に成立した**: qwen4exp runtime(移植版)+ ternary MoE expert + Hadamard 活性回転で、
+  実モデルが decode でき、全 48 層が RTX 5090 32 GB に載る(28.9 GiB)。
+- **サイズ目標は達成**: 78 GiB → 57 GiB、Phase 2 の見積もりどおり。
+- **品質は未達**: 素の PTQ では PPL が 9 倍。27B と同じく、ここから先は
+  **reconstruction / ternary-aware fine-tune が必須**。
