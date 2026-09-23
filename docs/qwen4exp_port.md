@@ -74,7 +74,18 @@ arch 名 `dspark` と二重になる fork 既存の問題で、本移植とは�
   27B BF16 の 6.51 よりかなり低いが、この arch は 51 B の n-gram PLE embedding を持ち
   Wikipedia 系テキストを強く記憶するため、低い値自体は不自然ではない **[要確認]**。
 
-### 4-3. 参照 upstream ビルドとの greedy 比較(注意点あり)
+### 4-3. 実モデルでのコンポーネント確認(移植版のロードログ)
+
+| 項目 | 確認結果 |
+|---|---|
+| arch | `qwen4exp`、48 層、`n_embd` 2560 / `n_embd_out` 10240 |
+| **MoE routing** | `n_expert = 512`, `n_expert_used = 10` |
+| **PLE(n-gram)** | `ple.layers=[1]`, `ngram_size=3`, `heads_per_ngram=8`, 16 head の vocab/offset 配列、`per_layer_token_embd.weight`(27465 MiB)を **lazy read** で保持(前提 commit `fac889fb3` が効いている) |
+| **QSA indexer** | `indexer.head_count=4`, `key_length=128`, `top_k=2048`, `compress_ratios=[0,0,0,4,…]`、専用の **indexer KV cache**(512 cells)を生成 |
+| **hybrid memory** | `llama_kv_cache`(12 層 = full-attention 層)+ `llama_memory_recurrent`(48 層、R/S バッファ 112.6 MiB)が両方生成される |
+| 生成 | 正常に継続生成(graphs reused = 2) |
+
+### 4-4. 参照 upstream ビルドとの greedy 比較(注意点あり)
 
 ユーザーの `~/AI/LLM/Qwen3.8-Flash-Next/runtime/llama.cpp` は **cc231cb0d(2026-08-30)**。
 これは qwen4exp 追加(08-27)の直後の版で、**私が移植した後続修正を含まない**:
