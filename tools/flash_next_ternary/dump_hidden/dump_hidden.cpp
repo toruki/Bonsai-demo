@@ -31,19 +31,23 @@ static bool cb(struct ggml_tensor * t, bool ask, void * ud) {
     if (ask) {
         return std::regex_match(name, st->filter);
     }
-    if (t->type != GGML_TYPE_F32) {
+    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_I32) {
         LOG_WRN("skipping %s: type %s\n", name.c_str(), ggml_type_name(t->type));
         return true;
     }
-    if (!ggml_is_contiguous(t)) {
-        LOG_WRN("skipping %s: not contiguous\n", name.c_str());
+    const bool is_i32 = t->type == GGML_TYPE_I32;
+    const size_t row = t->ne[0] * ggml_type_size(t->type);
+    if (t->nb[0] != ggml_type_size(t->type) || t->ne[2] * t->ne[3] != 1) {
+        LOG_WRN("skipping %s: not a row-contiguous 2-D tensor\n", name.c_str());
         return true;
     }
-    const size_t nbytes = ggml_nbytes(t);
-    st->buf.resize(nbytes);
-    ggml_backend_tensor_get(t, st->buf.data(), 0, nbytes);
-    std::ofstream f(st->outdir + "/" + name + ".f32", std::ios::binary | std::ios::app);
-    f.write((const char *) st->buf.data(), nbytes);
+    // rows may be strided (e.g. the top-k view of an argsort), so copy them one by one
+    st->buf.resize(row * t->ne[1]);
+    for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
+        ggml_backend_tensor_get(t, st->buf.data() + i1 * row, i1 * t->nb[1], row);
+    }
+    std::ofstream f(st->outdir + "/" + name + (is_i32 ? ".i32" : ".f32"), std::ios::binary | std::ios::app);
+    f.write((const char *) st->buf.data(), st->buf.size());
     auto & sh = st->shapes[name];
     if (sh.empty()) {
         sh = {t->ne[0], t->ne[1], t->ne[2], t->ne[3]};

@@ -74,6 +74,9 @@ def main() -> None:
     ap.add_argument("--method", default="mseopt", choices=["mseopt", "absmean"])
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--no-rotate", action="store_true", help="ternarize without the Hadamard fold/contract")
+    ap.add_argument("--values-dir", default=None,
+                    help="take already-folded ternary values from DIR/experts_L{N}.npz (keys gate/up/down) "
+                         "instead of computing them; used to write back trained experts")
     ap.add_argument("--kv-only", action="store_true",
                     help="copy KVs and add the contract, but convert no tensor (for the KV shard of a split model)")
     ap.add_argument("--names", nargs="*", default=None, help="--kv-only: folded tensor names")
@@ -148,6 +151,15 @@ def main() -> None:
         """
         dims = [int(x) for x in t.shape]                  # gguf order, dims[0] = input axis
         logical = tuple(dims[::-1])
+        if a.values_dir:
+            m = re.match(r"blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$", t.name)
+            if not m:
+                raise SystemExit(f"--values-dir has nothing for {t.name}")
+            y = np.load(Path(a.values_dir) / f"experts_L{m.group(1)}.npz")[m.group(2)].astype(np.float32)
+            assert y.shape == logical, (t.name, y.shape, logical)
+            parts = [ptq1_0_quantize(y[i:i + 16]) for i in range(0, y.shape[0], 16)]
+            packed = np.concatenate(parts).reshape(quant_shape_to_byte_shape(logical, GGMLQuantizationType.PTQ1_0))
+            return packed, float((y == 0).mean()), float("nan")
         inner = int(np.prod(logical[1:])) if len(logical) > 1 else 1
         step = max(1, (1 << 28) // max(inner * 4, 1))      # ~256 MB of f32 per chunk
         parts, err, ref, zeros, count = [], 0.0, 0.0, 0, 0
