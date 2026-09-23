@@ -50,9 +50,59 @@ Prism 側の変更と本質的に競合する箇所は **無かった**。衝突
 `llama-arch.cpp` の tensor-info テーブルだけは upstream がフォーマットを全面変更していたため
 upstream 版を採用し、fork 固有のエントリが無いことを確認した(差分ゼロ)。
 
-## 4. 次のステップ
+## 4. ビルドと検証(移植版 = `build-q4x`, commit 09a2961cd)
 
-1. ビルド(CUDA、`build-q4x`)
+CUDA ビルド成功(724 ターゲット、arch 120a、CUDA 13.3)。
+
+### 4-1. upstream のテスト(移植した commit に含まれるもの)
+
+| テスト | 結果 |
+|---|---|
+| `test-llama-archs -a qwen4exp`(CUDA) | **OK** (err 8.73e-08)、state save/load も OK |
+| `test-llama-archs -a qwen4exp`(CPU) | **OK** (err 0.00e+00)、state save/load も OK |
+| `test-backend-ops -o DSV4_HC_{PRE,POST,COMB}` | **3 種とも OK**(CUDA) |
+| `test-quantize-fns`(fork の低 bit 型) | `pq2_0` / `ptq1_0` / `q4_0_e8` / `q2_e8` すべて OK — **移植で fork 側は壊れていない** |
+
+補足: `test-llama-archs` を全 arch で回すと fork 固有の `dspark` で停止する
+(`key not found: dspark.dspark.block_size`。KV 名が `%s.dspark.block_size` で
+arch 名 `dspark` と二重になる fork 既存の問題で、本移植とは無関係)。
+
+### 4-2. 実モデル(unsloth UD-IQ3_XXS、76 GiB)
+
+- ロード・生成とも正常。`-ngl 12` で prompt 5.5 t/s / gen 7.2 t/s。
+- wikitext-2 perplexity(8 chunk, c=512): **PPL 2.0245 ± 0.081**。
+  27B BF16 の 6.51 よりかなり低いが、この arch は 51 B の n-gram PLE embedding を持ち
+  Wikipedia 系テキストを強く記憶するため、低い値自体は不自然ではない **[要確認]**。
+
+### 4-3. 参照 upstream ビルドとの greedy 比較(注意点あり)
+
+ユーザーの `~/AI/LLM/Qwen3.8-Flash-Next/runtime/llama.cpp` は **cc231cb0d(2026-08-30)**。
+これは qwen4exp 追加(08-27)の直後の版で、**私が移植した後続修正を含まない**:
+
+| 修正 | 参照ビルドに含まれるか |
+|---|---|
+| `36b101543` seq_cp / block position keying / mtmd (09-01) | **含まれない** |
+| `41abbfd59` rms_norm+mul fusion (09-14) | **含まれない** |
+| `37b53fd45` hc ops (09-16) | **含まれない** |
+| `3cf03257f` sparse FA (09-20) | 含まれない(移植でも保留) |
+
+greedy(temp 0)32 token 比較の結果:
+
+| prompt | 結果 |
+|---|---|
+| "1, 1, 2, 3, 5, 8, 13," | **完全一致** |
+| "The capital of France is Paris..." | 20 token 目まで一致、以降 1 token の分岐 |
+| "def fibonacci(n):" | 14 token 目で分岐 |
+
+分岐はいずれも同じ位置パターン(閉じ引用符の直後で `".` と `"` が拮抗)で起きており、
+**参照が古い実装であること**(特に position keying 修正の有無)と
+CUDA 13.3 / 12.8 の数値差の両方が原因になり得る。
+したがって「この参照との greedy 完全一致」は正当性の判定基準として不適切。
+代わりに参照ツリーで `llama-perplexity` をビルドし、同一 8 chunk の PPL を比較中。
+
+## 5. 次のステップ
+
+1. ~~ビルド~~ 完了
 2. **非 ternary の Flash-Next GGUF(unsloth UD-IQ3_XXS、76 GiB)で logits 正当性を確立**
    - 参照: ユーザーの upstream ビルド `~/AI/LLM/Qwen3.8-Flash-Next/runtime/llama.cpp`(cc231cb0d、qwen4exp あり)
    - 比較: 同一 prompt の greedy 生成一致、および `--kl-divergence-base` を上流で書き出して
