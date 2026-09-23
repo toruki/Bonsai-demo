@@ -154,3 +154,86 @@ qwen4exp については完全に同一のソースを持つ参照を用意し�
 3. それが通ってから MoE expert tensor のみ PTQ1_0/PQ2_0 を許可
 4. 最後に Hadamard(まず全て H128 で動作確認 → 後で gate/up を H512 に拡張。
    そのためには `prism.hadamard.block_size` を tensor 単位 / tensor class 単位へ拡張する)
+
+---
+
+# Step 3: MoE expert だけ ternary (H128 + PTQ1_0)
+
+## 6-1. コード変更(最小差分 2 行)
+
+| ファイル | 変更 |
+|---|---|
+| `src/llama-model.cpp` | `prism.hadamard` の arch ゲートに `LLM_ARCH_QWEN4EXP` を追加 |
+| `conversion/base.py` | `_HADAMARD_ARCHS` に `MODEL_ARCH.QWEN4EXP` を追加 |
+
+事前確認: qwen4exp の expert 3 本はすべて Hadamard 対応ヘルパーを通る
+(`build_moe_ffn` → `build_lora_mm_id`、gate/up は `llama-graph.cpp:2210-2242`、down は `:2346`)。
+runtime の「検証済み tensor 種別」リストには `ffn_{gate,up,down,gate_up}_exps` が既に入っていたため、
+**arch ゲートだけが障害だった**。qwen4exp の他の線形 18 箇所もすべて `build_lora_mm` 経由
+(生の `ggml_mul_mat` は indexer の score 計算 1 箇所のみで、重み行列ではない)。
+
+## 6-2. 新ツール `tools/flash_next_ternary/gguf_inject_ternary.py`
+
+既存 GGUF の指定 tensor だけを **H_block fold → group-128 ternary → PTQ1_0** に置き換え、
+他は bytes をそのままコピーする。置き換えた tensor だけに `prism.hadamard.*` contract を書くので、
+runtime はそこだけ活性を回転する。split GGUF 対応(`--kv-only` で KV shard に contract のみ追加、
+非先頭 shard は KV ブロックを持たないので `general.architecture` を合成しない)。
+ソースが量子化済みでも `gguf.quants.dequantize` で f32 に戻してから処理する。
+
+## 6-3. 合成モデルでの経路検証
+
+`test-llama-archs -a qwen4exp -o DIR` で小さな qwen4exp GGUF を生成 → 注入 → ロード:
+
+```
+- type ptq1_0: 4 tensors
+load_tensors: loaded 4 Hadamard-folded weight(s) (0 inverse-lookup)
+              using 1 rotation(s) and 2 sign vector(s)
+```
+
+ternary の relMSE 0.186–0.188 / zero 0.455(Gaussian に対する ternary の理論最適と一致)。
+合成モデルはトークナイザを持たないため forward までは進まない。
+
+## 6-4. 実モデル(unsloth UD-IQ3_XXS)の layer 0 を ternary 化
+
+対象: `blk.0.ffn_{gate,up,down}_exps.weight`(512 expert ぶん、2.5 B params)。
+元の型は gate/up が `IQ2_S`、down が `IQ4_NL`。それを dequantize → H128 fold → ternary → PTQ1_0。
+
+| tensor | 元の型 | shape | zero 率 | relMSE |
+|---|---|---|---:|---:|
+| `blk.0.ffn_down_exps.weight` | IQ4_NL | [640, 2560, 512] | 0.457 | 0.1869 |
+| `blk.0.ffn_gate_exps.weight` | IQ2_S | [2560, 640, 512] | 0.457 | 0.1866 |
+| `blk.0.ffn_up_exps.weight` | IQ2_S | [2560, 640, 512] | 0.457 | 0.1868 |
+
+shard 2 は 49.6 GB → 46.8 GB に縮小。
+
+### 結果
+
+```
+- type ptq1_0: 3 tensors
+load_tensors: loaded 3 Hadamard-folded weight(s) (0 inverse-lookup)
+              using 1 rotation(s) and 2 sign vector(s)
+
+> The capital of Japan is
+[Start thinking]
+We need to answer user's query: "The capital of Japan is".
+```
+
+| モデル | wikitext PPL(8 chunk, c=512, -ngl 12) |
+|---|---:|
+| 元の UD-IQ3_XXS | 2.0245 ± 0.081 |
+| **layer 0 の expert だけ ternary(H128 + PTQ1_0)** | **2.0349 ± 0.081** |
+
+**48 層中 1 層ぶんの expert を ternary にしたコストは PPL +0.5 %。**
+CUDA の MoE id 付き matmul(`build_lora_mm_id`)と活性側 Hadamard 回転が実モデルで正しく動作している。
+
+なおここで使った重みは元 GGUF の IQ2_S/IQ4_NL を dequantize したもので、
+BF16 原本ではない。**reconstruction 実験には BF16 teacher が要る**ので、そこは次段で HF から
+range read で取得する(27B と同じ `fetch_slice.py` の手順)。
+
+## 7. 次のステップ
+
+1. expert 1 個単位の reconstruction(teacher A = BF16 expert、teacher B = canonical、
+   27B で有効だった dual 目的関数)→ 学習済み ternary expert を注入して PPL を再測定
+2. Hadamard block を tensor 単位 / tensor class 単位へ拡張し、gate/up を H512 に
+   (`prism.hadamard.block_size` が現状は GGUF 全体で単一値)
+3. 全 48 層への展開と VRAM 実測
