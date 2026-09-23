@@ -218,13 +218,16 @@ load_tensors: loaded 3 Hadamard-folded weight(s) (0 inverse-lookup)
 We need to answer user's query: "The capital of Japan is".
 ```
 
-| モデル | wikitext PPL(8 chunk, c=512, -ngl 12) |
-|---|---:|
-| 元の UD-IQ3_XXS | 2.0245 ± 0.081 |
-| **layer 0 の expert だけ ternary(H128 + PTQ1_0)** | **2.0349 ± 0.081** |
+| モデル | 8 chunk | 32 chunk |
+|---|---:|---:|
+| 元の UD-IQ3_XXS | 2.0245 ± 0.081 | 2.4783 ± 0.052 |
+| **layer 0 の expert だけ ternary(H128 + PTQ1_0)** | 2.0022 ± 0.077 | **2.5057 ± 0.052** |
 
-**48 層中 1 層ぶんの expert を ternary にしたコストは PPL +0.5 %。**
-CUDA の MoE id 付き matmul(`build_lora_mm_id`)と活性側 Hadamard 回転が実モデルで正しく動作している。
+8 chunk では差が誤差棒に埋もれた(ternary の方が僅かに低い)ため 32 chunk で測り直した。
+**48 層中 1 層ぶんの expert(512 expert, 2.5 B params)を ternary 化したコストは PPL +1.1 %**
+(2.4783 → 2.5057)。誤差棒 ±0.05 に対して差 0.027 なので、これでもまだ有意とは言い切れない **[要注意]**。
+いずれにせよ CUDA の MoE id 付き matmul(`build_lora_mm_id`)と活性側 Hadamard 回転が
+実モデルで正しく動作している。
 
 なおここで使った重みは元 GGUF の IQ2_S/IQ4_NL を dequantize したもので、
 BF16 原本ではない。**reconstruction 実験には BF16 teacher が要る**ので、そこは次段で HF から
