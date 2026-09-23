@@ -306,16 +306,24 @@ The user is asking about the capital of Japan. This is a straightforward factual
 しかし PPL は 9 倍に悪化。層あたりのコスト(+0.027)から線形に予測される 3.8 を大きく超えており、
 **27B で観測したのと同じ超線形な累積**が Flash-Next でも起きている。
 
-ただしこの比較には手法差が混じっている点に注意:
+### 手法差と規模効果の切り分け
 
-| | 量子化器 | Hadamard |
-|---|---|---|
-| layer 0 版 | group-128 の MSE 最適 | H128 fold あり |
-| 全層版 | `llama-quantize` の RTN(absmax) | なし |
+上の 2 行は量子化器も違うので、layer 0 を素の RTN(fold なし)でも作って 3 点比較した:
 
-27B の知見(`docs/ptq_vs_shipped_27b.md`)では **RTN(absmean 相当)は MSE 最適より PPL で 18 倍悪かった**。
-つまり 22.3 のうち相当部分は量子化器の差で説明できる可能性が高く、
-fold + MSE 最適 + reconstruction を入れた値とは別物として扱う必要がある。
+| 条件 | 量子化器 | Hadamard | 32 chunk PPL |
+|---|---|---|---:|
+| baseline | — | — | 2.4783 ± 0.052 |
+| layer 0 のみ | group-128 MSE 最適 | H128 | 2.5057 ± 0.052 |
+| layer 0 のみ | RTN (absmax) | なし | 2.5314 ± 0.053 |
+| 全 48 層 | RTN (absmax) | なし | 22.275 ± 0.748 |
+
+- **1 層での手法差はごく小さい**(2.5057 → 2.5314、+0.026)。H128 + MSE 最適は RTN より僅かに良いだけ。
+- **1 層あたりのコストも小さい**(baseline 比 +0.053)。48 倍しても線形なら 5.0 程度。
+- **実測は 22.3**。したがって 22.3 の主因は量子化器の差ではなく、
+  **層をまたいだ超線形な誤差累積**である(27B で観測したのと同じ現象)。
+
+この切り分けは重要で、「もっと良い PTQ 量子化器を選ぶ」方向では解決しないことを意味する。
+27B と同じく reconstruction / ternary-aware fine-tune が本質的に必要。
 
 ## 9. 現時点の結論
 
