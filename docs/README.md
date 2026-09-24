@@ -19,7 +19,7 @@
 | 9 | [head_calibration.md](head_calibration.md) | stream × head のクロス評価と較正 | 出荷の優位は stream と head の共適応。後付け較正では埋まらない |
 | 10 | [suffix_pilot.md](suffix_pilot.md) | suffix-aware(最終 logits への KL)progressive | baseline より悪化。logits 目的関数はデータ律速 |
 | 11 | [qwen4exp_port.md](qwen4exp_port.md) | Flash-Next runtime の移植と ternary expert | **移植完了・全 48 層 ternary が 5090 に載る(28.9 GiB)**。品質は未達 |
-| 12 | [flash_next_progressive_pilot.md](flash_next_progressive_pilot.md) | Flash-Next layer 4–11 の progressive pilot | PTQ 比で PPL 増分 52 % 減、KL 31 % 減。基準(半減)は PPL のみぎりぎり達成 |
+| 12 | [flash_next_progressive_pilot.md](flash_next_progressive_pilot.md) | Flash-Next layer 4–11 の progressive pilot | PTQ 比 KL 31 % 減、データ 4 倍で 40 % 減(0.115)。下流 routing 変化 11 % が残る |
 
 ## 到達点
 

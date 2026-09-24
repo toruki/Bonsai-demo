@@ -134,15 +134,19 @@ class LayerRunner:
         self.rot = Qwen4ExpTextRotaryEmbedding(cfg).to(device)
         self.cache = {}
 
-    def __call__(self, mod, x: torch.Tensor) -> torch.Tensor:
+    def pe_mask(self, x: torch.Tensor):
+        """Rotary embeddings and causal mask for a full-attention (QSA) layer."""
         B, L, _ = x.shape
-        if mod.layer_type == "linear_attention":
-            return mod(x, position_embeddings=None, attention_mask=None)
         key = (B, L, x.dtype, x.device)
         if key not in self.cache:
             pos = torch.arange(L, device=x.device)[None, None, :].expand(3, B, L)
             pe = self.rot(x, pos)
             mask = torch.full((L, L), float("-inf"), device=x.device, dtype=x.dtype).triu(1)[None, None].expand(B, 1, L, L)
             self.cache[key] = (pe, mask)
-        pe, mask = self.cache[key]
+        return self.cache[key]
+
+    def __call__(self, mod, x: torch.Tensor) -> torch.Tensor:
+        if mod.layer_type == "linear_attention":
+            return mod(x, position_embeddings=None, attention_mask=None)
+        pe, mask = self.pe_mask(x)
         return mod(x, position_embeddings=pe, attention_mask=mask)

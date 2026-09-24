@@ -37,14 +37,18 @@ static bool cb(struct ggml_tensor * t, bool ask, void * ud) {
     }
     const bool is_i32 = t->type == GGML_TYPE_I32;
     const size_t row = t->ne[0] * ggml_type_size(t->type);
-    if (t->nb[0] != ggml_type_size(t->type) || t->ne[2] * t->ne[3] != 1) {
-        LOG_WRN("skipping %s: not a row-contiguous 2-D tensor\n", name.c_str());
+    if (ggml_is_contiguous(t)) {
+        st->buf.resize(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, st->buf.data(), 0, st->buf.size());
+    } else if (t->nb[0] == ggml_type_size(t->type) && t->ne[2] * t->ne[3] == 1) {
+        // 2-D view with strided rows (e.g. the top-k view of an argsort): copy row by row
+        st->buf.resize(row * t->ne[1]);
+        for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
+            ggml_backend_tensor_get(t, st->buf.data() + i1 * row, i1 * t->nb[1], row);
+        }
+    } else {
+        LOG_WRN("skipping %s: not contiguous\n", name.c_str());
         return true;
-    }
-    // rows may be strided (e.g. the top-k view of an argsort), so copy them one by one
-    st->buf.resize(row * t->ne[1]);
-    for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
-        ggml_backend_tensor_get(t, st->buf.data() + i1 * row, i1 * t->nb[1], row);
     }
     std::ofstream f(st->outdir + "/" + name + (is_i32 ? ".i32" : ".f32"), std::ios::binary | std::ios::app);
     f.write((const char *) st->buf.data(), st->buf.size());

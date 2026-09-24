@@ -95,6 +95,30 @@ routing の変化は置換層の後も下流で減衰せず、むしろ増える
 2. hc norm と shared expert gate を学習対象に戻し、GGUF 書き出しに対応させる
 3. 下流の routing 変化を直接抑える項(次層 router logits の KL)を目的関数に加える
 
+## 7. 追加実験 1: 学習データ 4 倍(1024 系列、loss は同じ)
+
+wikitext-2 train の chunk 0–1023(既存 256 + 新規 768)。他の設定は §2 と同じ(lr 1e-4、300 step/層、
+hc norm 凍結)。300 step × batch 2 なので各系列は高々 1 回しか見ない(256 系列では平均 2.3 回)。
+
+| | PTQ | 256 系列 | **1024 系列** | 48 層へ進む目安 |
+|---|---:|---:|---:|---:|
+| PPL | 2.5769 | 2.5252 | **2.5191** | |
+| PPL 増分 | +0.0986 | +0.0469 | **+0.0408** | |
+| mean KL | 0.1898 | 0.1302 | **0.1149** | ≤ 0.10–0.11 |
+| KL 99 % | 2.243 | 1.723 | 1.455 | |
+| same top-1 | 88.17 % | 90.00 % | 90.49 % | |
+| routing 集合変化: 置換層 5–11 | 12.1 % | 8.4 % | 7.9 % | < 7 % |
+| routing 集合変化: 下流 12–46 | 14.5 % | 11.4 % | 10.9 % | < 8–9 % |
+| stream relMSE: layer 4 / 7 / 11 | 0.0143 / 0.0600 / 0.0714 | 0.0090 / 0.0342 / 0.0404 | 0.0086 / 0.0320 / 0.0373 | |
+
+データ増で KL は 12 %、KL 99 % は 16 % 下がった。ただし KL は 0.10 付近に届かず、
+下流の routing 変化もほとんど動かない。データ不足は原因の一部に過ぎず、routing の増幅は
+層単位の出力再構成では抑えきれていない。→ 次層 router の KL 項を加える(§8)。
+
+途中経過: layer 8 の npz 保存中に `/` が満杯になり、`np.savez` がエラーを出さずにファイルを
+切り詰めた。保存後のサイズ検証を追加し、`--resume`(保存済みの層は npz の値でストリームだけ進める)で
+layer 8 から再開した。復元した layer 4–7 の stream relMSE は記録値と 4 桁一致。
+
 ## 再現
 
 ```bash
@@ -106,4 +130,13 @@ bash $T/eval_q4x_variant.sh base
 bash $T/eval_q4x_variant.sh ptq  /data/eval/q4x_pilot_ptq  4 11
 bash $T/eval_q4x_variant.sh prog /data/eval/q4x_pilot_prog 4 11
 python $T/routing_change.py /home/sohey/AI/LLM/q4x_eval/route_base /home/sohey/AI/LLM/q4x_eval/route_prog
+
+# §7: 1024 系列(chunk 256-1023 を追加採取)
+dump_hidden_q4x -m <IQ3_XXS> -f wiki.train.raw -c 512 -b 512 -ub 512 -ngl 24 --no-logits \
+    --n-chunks 768 --chunk-offset 256 --chunk-len 512 --dump-filter '^l_last-3$' --dump-dir act_train_256_1024
+python $T/q4x_progressive.py --first 4 --last 11 --steps 300 --eval-every 300 --lr-w 1e-4 --lr-norm 0 \
+    --train-dir /data/eval/q4x_act_train act_train_256_1024 --out pilot_d1024 [--resume]
+bash $T/eval_q4x_variant.sh d1024 pilot_d1024 4 11
 ```
+
+PTQ / 256 系列の npz と評価済みモデルは `/mnt/f/q4x_archive/` に退避してある。

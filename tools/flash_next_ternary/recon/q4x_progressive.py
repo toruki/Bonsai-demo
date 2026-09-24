@@ -195,6 +195,19 @@ class TernaryExperts(nn.Module):
                                 self.dn_lat, self.dn_s, self.rot_i, self.I, self.opt)
 
     @torch.no_grad()
+    def load_values(self, npz: Path):
+        """Set the latents to already-exported ternary values (experts_L{N}.npz), so that
+        quant(lat, s) reproduces them exactly: s = |value| of each group (1 for all-zero groups)."""
+        z = np.load(npz)
+        for lat, sc, v in ((self.gu_lat, self.gu_s, np.concatenate([z["gate"], z["up"]], axis=1)),
+                           (self.dn_lat, self.dn_s, z["down"])):
+            for e0 in range(0, lat.shape[0], 32):
+                w = torch.from_numpy(v[e0:e0 + 32]).to(lat.device).float()
+                g = w.abs().reshape(*w.shape[:-1], -1, GROUP).amax(-1)
+                lat[e0:e0 + 32] = w; sc[e0:e0 + 32] = torch.where(g > 0, g, torch.ones_like(g))
+            del v
+
+    @torch.no_grad()
     def export(self):
         """folded ternary values per GGUF tensor ([E, rows, in] numpy float32) + codes."""
         gu, gt, _ = quant(self.gu_lat, self.gu_s.half().float())
@@ -203,6 +216,47 @@ class TernaryExperts(nn.Module):
         return {"gate": gu[:, :I].cpu().numpy(), "up": gu[:, I:].cpu().numpy(), "down": dn.cpu().numpy(),
                 "codes": {"gate": gt[:, :I].to(torch.int8).cpu(), "up": gt[:, I:].to(torch.int8).cpu(),
                           "down": dt.to(torch.int8).cpu()}}
+
+
+class NextRouter:
+    """Teacher layer L+1 up to its MoE router (attention half + mlp hyper-connection + gate),
+    used to measure how the student's output of layer L moves the next layer's routing."""
+
+    def __init__(self, g, il, cfg, runner, device="cuda"):
+        from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextDecoderLayer
+        W = {k: v for k, v in layer_weights(g, il, cfg).items()
+             if not k.startswith(("mlp.experts.", "mlp.shared_expert"))}
+        c = text_config(); c._attn_implementation = "eager"
+        mod = Qwen4ExpTextDecoderLayer(c, il)
+        mod.mlp.experts = nn.Identity(); mod.mlp.shared_expert = nn.Identity(); mod.mlp.shared_expert_gate = nn.Identity()
+        miss, unexp = mod.load_state_dict({k: v.float() for k, v in W.items()}, strict=False)
+        assert not unexp and all(k.startswith("ple.") for k in miss), (miss, unexp)
+        assert mod.ple is None
+        self.mod = mod.to(device).eval().requires_grad_(False)
+        self.runner, self.H, self.k = runner, cfg.hidden_size, cfg.num_experts_per_tok
+
+    def logits(self, x):
+        m = self.mod
+        h, hin, inj = m.attn_hyper_connection(x)
+        if m.layer_type == "linear_attention":
+            h = m.linear_attn(h, cache_params=None, attention_mask=None)
+        else:
+            pe, mask = self.runner.pe_mask(x)
+            h, _ = m.self_attn(h, pe, attention_mask=mask)
+        x2 = hin + (h.unsqueeze(-2) * inj.unsqueeze(-1)).flatten(-2)
+        h2, _, _ = m.mlp_hyper_connection(x2)
+        return F.linear(h2.reshape(-1, self.H), m.mlp.gate.weight).float()
+
+
+def router_kl(lt, ls):
+    """KL(p_teacher || p_student) over the full expert softmax, mean over tokens."""
+    return (F.softmax(lt, -1) * (F.log_softmax(lt, -1) - F.log_softmax(ls, -1))).sum(-1).mean()
+
+
+def topk_change(lt, ls, k):
+    """1 - |top-k(teacher) ∩ top-k(student)| / k, mean over tokens."""
+    a, b = lt.topk(k, -1).indices, ls.topk(k, -1).indices
+    return float(1 - (a.unsqueeze(-1) == b.unsqueeze(-2)).any(-1).float().sum(-1).mean() / k)
 
 
 # --------------------------------------------------------------------- data
@@ -234,11 +288,17 @@ def main():
     ap.add_argument("--lr-s", type=float, default=1e-4)
     ap.add_argument("--lr-norm", type=float, default=1e-4)
     ap.add_argument("--anchor", type=float, default=0.2)
+    ap.add_argument("--router-kl", type=float, default=0.0,
+                    help="weight of KL(next-layer router | teacher output || student output); 0 = off")
     ap.add_argument("--cos-weight", type=float, default=1.0)
     ap.add_argument("--eval-every", type=int, default=200)
-    ap.add_argument("--train-dir", default="/data/eval/q4x_act_train")
+    ap.add_argument("--train-dir", nargs="+", default=["/data/eval/q4x_act_train"],
+                    help="one or more stream dumps, concatenated along the sequence axis")
     ap.add_argument("--valid-dir", default="/data/eval/q4x_act_valid")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--resume", action="store_true",
+                    help="layers whose experts_L{N}.npz already exists in --out are not retrained: their "
+                         "saved values only advance the streams")
     a = ap.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.manual_seed(0)
@@ -247,14 +307,30 @@ def main():
     cfg = text_config(); width = cfg.hidden_size * cfg.hc_count
     runner = LayerRunner(cfg, dev)
     g = GGUFTensors(FLASH_GGUF)
-    S_tr = load_stream(Path(a.train_dir), width); S_va = load_stream(Path(a.valid_dir), width)
+    S_tr = torch.cat([load_stream(Path(d), width) for d in a.train_dir]); S_va = load_stream(Path(a.valid_dir), width)
     C_tr, C_va = S_tr.clone(), S_va.clone()
     print(f"streams: train {tuple(S_tr.shape)} valid {tuple(S_va.shape)}", flush=True)
     log = {"args": vars(a), "layers": {}}
+    if a.resume and (out / "log.json").exists():
+        log["layers"] = json.load(open(out / "log.json"))["layers"]
 
     for L in range(a.first, a.last + 1):
         t0 = time.time(); ll = {}
         W = layer_weights(g, L, cfg)
+        done = out / f"experts_L{L}.npz"
+        if a.resume and done.exists() and str(L) in log["layers"]:
+            teacher, _, _, _ = build_layer(L, W, device=dev)
+            C_tr, C_va = run(teacher, runner, C_tr), run(teacher, runner, C_va)
+            del teacher; torch.cuda.empty_cache()
+            student, _, _, _ = build_layer(L, {k: v for k, v in W.items() if not k.startswith("mlp.experts.")}, device=dev)
+            student.mlp.experts = TernaryExperts(W["mlp.experts.gate_up_proj"], W["mlp.experts.down_proj"], dev)
+            del W
+            student.mlp.experts.load_values(done)
+            S_tr, S_va = run(student, runner, S_tr), run(student, runner, S_va)
+            print(f"=== layer {L} resumed from {done.name}: stream vs canonical relMSE {rel(S_va, C_va):.4f} "
+                  f"(logged {log['layers'][str(L)]['exit_stream_vsC']:.4f})  ({time.time()-t0:.0f}s)", flush=True)
+            del student; gc.collect(); torch.cuda.empty_cache()
+            continue
         teacher, _, miss, unexp = build_layer(L, W, device=dev)
         assert not miss and not unexp
         A_tr, A_va = run(teacher, runner, S_tr), run(teacher, runner, S_va)
@@ -273,13 +349,30 @@ def main():
         for p in [ex.gu_lat, ex.dn_lat] + scl + nrm:
             p.requires_grad_(True)
 
+        nr = NextRouter(g, L + 1, cfg, runner, dev) if L + 1 < cfg.num_hidden_layers else None
+
         @torch.no_grad()
         def evaluate():
             Y = run(student, runner, S_va)
             dA = rel(Y.float() - S_va.float(), A_va.float() - S_va.float())
-            return {"delta_vsA": dA, "stream_vsC": rel(Y, Cx_va), "Y": Y}
+            out = {"delta_vsA": dA, "stream_vsC": rel(Y, Cx_va), "Y": Y}
+            if nr is not None:                     # next-layer routing: student vs teacher(same input) / canonical
+                kl = chA = chC = 0.0; n = 0
+                for i in range(0, Y.shape[0], 2):
+                    ls = nr.logits(Y[i:i + 2].to(dev).float())
+                    la = nr.logits(A_va[i:i + 2].to(dev).float()); lc = nr.logits(Cx_va[i:i + 2].to(dev).float())
+                    kl += float(router_kl(la, ls)); chA += topk_change(la, ls, nr.k); chC += topk_change(lc, ls, nr.k); n += 1
+                out.update(next_kl_vsA=kl / n, next_route_vsA=chA / n, next_route_vsC=chC / n)
+            return out
+
+        def fmt(e):
+            s = f"delta vsA relMSE {e['delta_vsA']:.4f} | stream vsC relMSE {e['stream_vsC']:.4f}"
+            if "next_kl_vsA" in e:
+                s += (f" | next router KL vsA {e['next_kl_vsA']:.4f} route chg vsA {e['next_route_vsA']:.4f}"
+                      f" vsC {e['next_route_vsC']:.4f}")
+            return s
         e0 = evaluate(); ll["ptq"] = {k: v for k, v in e0.items() if k != "Y"}
-        print(f"  PTQ init : delta vsA relMSE {e0['delta_vsA']:.4f} | stream vsC relMSE {e0['stream_vsC']:.4f}", flush=True)
+        print(f"  PTQ init : {fmt(e0)}", flush=True)
 
         if a.steps > 0:
             ex.opt = FusedAdam({"gu": ex.gu_lat, "dn": ex.dn_lat}, lr=a.lr_w)
@@ -298,6 +391,12 @@ def main():
                 lC = ((d - (yC - x)) ** 2).sum() / ((yC - x) ** 2).sum()
                 lcos = 1 - F.cosine_similarity(y.reshape(-1, width), yA.reshape(-1, width), dim=1).mean()
                 loss = lA + a.anchor * lC + a.cos_weight * lcos
+                lr_kl = torch.zeros((), device=dev)
+                if a.router_kl > 0 and nr is not None:
+                    with torch.no_grad():
+                        lt = nr.logits(yA)
+                    lr_kl = router_kl(lt, nr.logits(y))
+                    loss = loss + a.router_kl * lr_kl
                 opt_s.zero_grad(set_to_none=True)
                 loss.backward()                           # latents are updated inside backward
                 ex.gu_lat.grad = None; ex.dn_lat.grad = None
@@ -307,13 +406,13 @@ def main():
                     for s in scl: s.clamp_(min=1e-6)
                 if step % 50 == 0:
                     print(f"    step {step:4d} loss {loss.item():.4f} A {lA.item():.4f} C {lC.item():.4f} "
-                          f"({time.time()-tt:.0f}s, peak {torch.cuda.max_memory_allocated()/2**30:.1f}G)", flush=True)
+                          f"R {lr_kl.item():.4f} ({time.time()-tt:.0f}s, peak {torch.cuda.max_memory_allocated()/2**30:.1f}G)", flush=True)
                 if step % a.eval_every == 0 or step == a.steps:
                     ev = evaluate()
-                    print(f"    [eval {step}] delta vsA relMSE {ev['delta_vsA']:.4f} | stream vsC relMSE {ev['stream_vsC']:.4f}", flush=True)
+                    print(f"    [eval {step}] {fmt(ev)}", flush=True)
             ex.opt = None
             # the last step's graph (loss -> ... -> TernaryMoE ctx) holds the optimizer state
-            del loss, lA, lC, lcos, y, d, x, yA, yC, opt_s
+            del loss, lA, lC, lcos, lr_kl, y, d, x, yA, yC, opt_s
             e1 = evaluate(); ll["trained"] = {k: v for k, v in e1.items() if k != "Y"}
         else:
             e1 = e0
@@ -321,14 +420,18 @@ def main():
         S_tr = run(student, runner, S_tr); S_va = e1["Y"]
         C_tr, C_va = Cx_tr, Cx_va
         exp = ex.export()
-        np.savez(out / f"experts_L{L}.npz", gate=exp["gate"].astype(np.float16), up=exp["up"].astype(np.float16),
-                 down=exp["down"].astype(np.float16))
+        arrs = {k: exp[k].astype(np.float16) for k in ("gate", "up", "down")}
+        np.savez(out / f"experts_L{L}.npz", **arrs)
+        size, need = (out / f"experts_L{L}.npz").stat().st_size, sum(v.nbytes for v in arrs.values())
+        if size < need:                                          # a full disk truncates silently
+            raise RuntimeError(f"experts_L{L}.npz truncated: {size} < {need} bytes")
+        del arrs
         ll["exit_stream_vsC"] = rel(S_va, C_va)
         ll["zero_frac"] = float(sum((c == 0).float().mean() for c in exp["codes"].values()) / 3)
         print(f"  EXIT layer {L}: stream vs canonical relMSE {ll['exit_stream_vsC']:.4f}  zero {ll['zero_frac']:.3f}  ({time.time()-t0:.0f}s)", flush=True)
         log["layers"][str(L)] = ll
         json.dump(log, open(out / "log.json", "w"), indent=1)
-        del student, ex, scl, nrm, A_tr, A_va, e0, e1; gc.collect(); torch.cuda.empty_cache()
+        del student, ex, scl, nrm, nr, A_tr, A_va, e0, e1; gc.collect(); torch.cuda.empty_cache()
         print(f"  (layer end: allocated {torch.cuda.memory_allocated()/2**30:.2f}G)", flush=True)
         torch.cuda.reset_peak_memory_stats()
     print("Q4X PROGRESSIVE DONE", flush=True)
