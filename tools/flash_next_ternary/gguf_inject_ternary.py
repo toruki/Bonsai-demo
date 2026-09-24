@@ -29,6 +29,7 @@ from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType  # noqa: E402
 from gguf.quants import dequantize, quant_shape_to_byte_shape  # noqa: E402
 
 from bonsai_format import hadamard_matrix, ptq1_0_quantize  # noqa: E402
+from ternary_store import load_experts  # noqa: E402
 
 
 def make_signs(width: int, seed: int) -> np.ndarray:
@@ -139,6 +140,14 @@ def main() -> None:
     # two passes: sizes first (cheap), then compute + write one tensor at a time so the
     # working set never exceeds a single tensor (a whole-model run otherwise needs ~30 GB)
     UNQ = (GGMLQuantizationType.F32, GGMLQuantizationType.F16, GGMLQuantizationType.BF16)
+    _cache = {}
+
+    def trained_values(layer: int) -> dict:
+        """gate/up/down values of one layer from --values-dir (one layer kept at a time)."""
+        if layer not in _cache:
+            _cache.clear()
+            _cache[layer] = load_experts(Path(a.values_dir) / f"experts_L{layer}.npz")
+        return _cache[layer]
 
     def convert(t):
         """Fold + ternarize + pack, in chunks along the outermost axis.
@@ -155,7 +164,7 @@ def main() -> None:
             m = re.match(r"blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$", t.name)
             if not m:
                 raise SystemExit(f"--values-dir has nothing for {t.name}")
-            y = np.load(Path(a.values_dir) / f"experts_L{m.group(1)}.npz")[m.group(2)].astype(np.float32)
+            y = trained_values(int(m.group(1)))[m.group(2)].astype(np.float32)
             assert y.shape == logical, (t.name, y.shape, logical)
             parts = [ptq1_0_quantize(y[i:i + 16]) for i in range(0, y.shape[0], 16)]
             packed = np.concatenate(parts).reshape(quant_shape_to_byte_shape(logical, GGMLQuantizationType.PTQ1_0))

@@ -33,6 +33,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
 from bonsai_format import hadamard_matrix  # noqa: E402
 from gguf_inject_ternary import make_signs  # noqa: E402
+from ternary_store import load_experts, save_experts  # noqa: E402
 from q4x_layer import FLASH_GGUF, GGUFTensors, LayerRunner, build_layer, layer_weights, text_config  # noqa: E402
 
 BLOCK = 128
@@ -89,19 +90,60 @@ def ste_grads(gW, lat, s):
 
 class FusedAdam:
     """Adam applied per expert inside TernaryMoE.backward: the full-size latent gradient
-    (10 GB) is never materialised, and m/v are kept in bf16 (10 GB instead of 20)."""
+    (10 GB) is never materialised, and m/v are kept in bf16 (10 GB instead of 20).
 
-    def __init__(self, params: dict, lr=2e-4, betas=(0.9, 0.99), eps=1e-8):
-        self.m = {k: torch.zeros_like(p, dtype=torch.bfloat16) for k, p in params.items()}
-        self.v = {k: torch.zeros_like(p, dtype=torch.bfloat16) for k, p in params.items()}
+    state_bits=8 keeps them blockwise-quantised instead (5 GB): m as int8 and sqrt(v) as uint8,
+    one fp16 absmax scale per GROUP elements. Every step still computes m, v and the update in
+    fp32; only the state carried to the next step is rounded. A carried sqrt(v) that rounds to 0
+    is read back as half a quantisation step, so a tiny v cannot turn into a huge update."""
+
+    def __init__(self, params: dict, lr=2e-4, betas=(0.9, 0.99), eps=1e-8, state_bits=16):
+        assert state_bits in (8, 16)
+        self.bits = state_bits
+        if state_bits == 16:
+            self.m = {k: torch.zeros_like(p, dtype=torch.bfloat16) for k, p in params.items()}
+            self.v = {k: torch.zeros_like(p, dtype=torch.bfloat16) for k, p in params.items()}
+        else:
+            sc = lambda p: torch.zeros(*p.shape[:-1], p.shape[-1] // GROUP, dtype=torch.float16, device=p.device)  # noqa: E731
+            self.mq = {k: torch.zeros_like(p, dtype=torch.int8) for k, p in params.items()}
+            self.vq = {k: torch.zeros_like(p, dtype=torch.uint8) for k, p in params.items()}
+            self.ms = {k: sc(p) for k, p in params.items()}
+            self.vs = {k: sc(p) for k, p in params.items()}
         self.lr, self.b1, self.b2, self.eps, self.t = lr, betas[0], betas[1], eps, 0
+
+    @staticmethod
+    def _blocks(x):
+        return x.reshape(*x.shape[:-1], -1, GROUP)
+
+    def _load(self, key, e):
+        if self.bits == 16:
+            return self.m[key][e].float(), self.v[key][e].float()
+        shp = self.mq[key][e].shape
+        m = (self._blocks(self.mq[key][e].float()) * self.ms[key][e].float()[..., None]).reshape(shp)
+        q = self._blocks(self.vq[key][e].float())
+        r = ((q + 0.5 * (q == 0)) * self.vs[key][e].float()[..., None]).reshape(shp)
+        return m, r * r
+
+    def _store(self, key, e, mf, vf):
+        if self.bits == 16:
+            self.m[key][e].copy_(mf); self.v[key][e].copy_(vf); return
+        mb = self._blocks(mf)
+        s = (mb.abs().amax(-1) / 127).to(torch.float16)
+        sf = s.float()[..., None].clamp(min=1e-30)
+        self.mq[key][e].copy_(torch.round(mb / sf).clamp_(-127, 127).reshape(mf.shape).to(torch.int8))
+        self.ms[key][e].copy_(s)
+        rb = self._blocks(vf.sqrt())
+        s = (rb.amax(-1) / 255).to(torch.float16)
+        sf = s.float()[..., None].clamp(min=1e-30)
+        self.vq[key][e].copy_(torch.round(rb / sf).clamp_(0, 255).reshape(vf.shape).to(torch.uint8))
+        self.vs[key][e].copy_(s)
 
     @torch.no_grad()
     def update(self, key, lat_e, e, grad):
-        m, v = self.m[key][e], self.v[key][e]
-        mf = m.float().mul_(self.b1).add_(grad, alpha=1 - self.b1)
-        vf = v.float().mul_(self.b2).addcmul_(grad, grad, value=1 - self.b2)
-        m.copy_(mf); v.copy_(vf)
+        mf, vf = self._load(key, e)
+        mf.mul_(self.b1).add_(grad, alpha=1 - self.b1)
+        vf.mul_(self.b2).addcmul_(grad, grad, value=1 - self.b2)
+        self._store(key, e, mf, vf)
         bc1, bc2 = 1 - self.b1 ** self.t, 1 - self.b2 ** self.t
         lat_e.addcdiv_(mf, vf.div_(bc2).sqrt_().add_(self.eps), value=-self.lr / bc1)
 
@@ -195,10 +237,11 @@ class TernaryExperts(nn.Module):
                                 self.dn_lat, self.dn_s, self.rot_i, self.I, self.opt)
 
     @torch.no_grad()
-    def load_values(self, npz: Path):
-        """Set the latents to already-exported ternary values (experts_L{N}.npz), so that
-        quant(lat, s) reproduces them exactly: s = |value| of each group (1 for all-zero groups)."""
-        z = np.load(npz)
+    def load_values(self, src):
+        """Set the latents to already-exported ternary values (experts_L{N}.npz, or a dict with the
+        same gate/up/down arrays), so that quant(lat, s) reproduces them exactly:
+        s = |value| of each group (1 for all-zero groups)."""
+        z = load_experts(src) if isinstance(src, (str, Path)) else src
         for lat, sc, v in ((self.gu_lat, self.gu_s, np.concatenate([z["gate"], z["up"]], axis=1)),
                            (self.dn_lat, self.dn_s, z["down"])):
             for e0 in range(0, lat.shape[0], 32):
@@ -307,6 +350,22 @@ def main():
     ap.add_argument("--resume", action="store_true",
                     help="layers whose experts_L{N}.npz already exists in --out are not retrained: their "
                          "saved values only advance the streams")
+    ap.add_argument("--steps-schedule", default=None,
+                    help="adaptive steps from the layer's PTQ delta relMSE, e.g. '0.15:300,0.22:600,inf:900' "
+                         "(first threshold above the PTQ error wins); overrides --steps")
+    ap.add_argument("--patience", type=int, default=0,
+                    help="early stop when the valid delta relMSE has not improved for this many steps "
+                         "(checked every --eval-every); the best evaluated state is kept. 0 = off")
+    ap.add_argument("--probe", type=int, default=0,
+                    help="also report the stream error after passing the student output (and the canonical one) "
+                         "through the next N unmodified teacher layers, at PTQ init and after training")
+    ap.add_argument("--adam-bits", type=int, default=16, choices=[8, 16],
+                    help="precision of the expert-latent Adam state (8 saves ~5 GB of VRAM)")
+    ap.add_argument("--stream-dir", default="/data/eval/q4x_streams")
+    ap.add_argument("--save-streams-at", type=int, nargs="*", default=[],
+                    help="save the student/canonical streams entering these layers to --stream-dir")
+    ap.add_argument("--load-streams", action="store_true",
+                    help="start from streams saved at --first instead of --train-dir/--valid-dir")
     a = ap.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.manual_seed(0)
@@ -315,15 +374,33 @@ def main():
     cfg = text_config(); width = cfg.hidden_size * cfg.hc_count
     runner = LayerRunner(cfg, dev)
     g = GGUFTensors(FLASH_GGUF)
-    S_tr = torch.cat([load_stream(Path(d), width) for d in a.train_dir]); S_va = load_stream(Path(a.valid_dir), width)
-    C_tr, C_va = S_tr.clone(), S_va.clone()
+    if a.load_streams:
+        sd = Path(a.stream_dir) / f"L{a.first}"
+        S_tr, S_va, C_tr, C_va = (torch.from_numpy(np.load(sd / f"{n}.npy")) for n in ("S_tr", "S_va", "C_tr", "C_va"))
+    else:
+        S_tr = torch.cat([load_stream(Path(d), width) for d in a.train_dir]); S_va = load_stream(Path(a.valid_dir), width)
+        C_tr, C_va = S_tr.clone(), S_va.clone()
     print(f"streams: train {tuple(S_tr.shape)} valid {tuple(S_va.shape)}", flush=True)
     log = {"args": vars(a), "layers": {}}
     if a.resume and (out / "log.json").exists():
         log["layers"] = json.load(open(out / "log.json"))["layers"]
 
+    def steps_for(ptq_err):
+        if not a.steps_schedule:
+            return a.steps
+        for part in a.steps_schedule.split(","):
+            thr, n = part.split(":")
+            if ptq_err < float(thr):
+                return int(n)
+        return int(a.steps_schedule.split(",")[-1].split(":")[1])
+
     for L in range(a.first, a.last + 1):
         t0 = time.time(); ll = {}
+        if L in a.save_streams_at:
+            sd = Path(a.stream_dir) / f"L{L}"; sd.mkdir(parents=True, exist_ok=True)
+            for n, t in (("S_tr", S_tr), ("S_va", S_va), ("C_tr", C_tr), ("C_va", C_va)):
+                np.save(sd / f"{n}.npy", t.numpy())
+            print(f"=== streams entering layer {L} saved to {sd}", flush=True)
         W = layer_weights(g, L, cfg)
         done = out / f"experts_L{L}.npz"
         if a.resume and done.exists() and str(L) in log["layers"]:
@@ -379,15 +456,43 @@ def main():
                 s += (f" | next router KL vsA {e['next_kl_vsA']:.4f} logit relMSE {e['next_logit_rel_vsA']:.4f} route chg vsA {e['next_route_vsA']:.4f}"
                       f" vsC {e['next_route_vsC']:.4f}")
             return s
+        probe_C = None
+
+        @torch.no_grad()
+        def probe(Y):
+            """stream error after the next a.probe unmodified teacher layers (student vs canonical)."""
+            nonlocal probe_C
+            first = probe_C is None
+            if first:
+                probe_C = []
+            xs, xc, res = Y, Cx_va, []
+            for j in range(1, a.probe + 1):
+                if L + j >= cfg.num_hidden_layers:
+                    break
+                tj, _, _, _ = build_layer(L + j, layer_weights(g, L + j, cfg), device=dev)
+                xs = run(tj, runner, xs)
+                if first:
+                    xc = run(tj, runner, xc); probe_C.append(xc)
+                del tj; torch.cuda.empty_cache()
+                res.append(rel(xs, probe_C[j - 1]))
+            return res
+
         e0 = evaluate(); ll["ptq"] = {k: v for k, v in e0.items() if k != "Y"}
         print(f"  PTQ init : {fmt(e0)}", flush=True)
+        if a.probe:
+            ll["ptq"]["probe"] = probe(e0["Y"])
+            print(f"  PTQ probe: stream vsC after +1..+{a.probe} teacher layers {[round(v, 4) for v in ll['ptq']['probe']]}", flush=True)
+        steps = steps_for(e0["delta_vsA"]); ll["steps"] = steps
 
-        if a.steps > 0:
-            ex.opt = FusedAdam({"gu": ex.gu_lat, "dn": ex.dn_lat}, lr=a.lr_w)
+        if steps > 0:
+            ex.opt = FusedAdam({"gu": ex.gu_lat, "dn": ex.dn_lat}, lr=a.lr_w, state_bits=a.adam_bits)
             opt_s = torch.optim.AdamW([{"params": scl, "lr": a.lr_s}, {"params": nrm, "lr": a.lr_norm}], betas=(0.9, 0.99), weight_decay=0.0)
-            sched = lambda t: 0.5 * (1 + math.cos(math.pi * min(t, a.steps) / a.steps))  # noqa: E731
+            sched = lambda t: 0.5 * (1 + math.cos(math.pi * min(t, steps) / steps))  # noqa: E731
             gen = torch.Generator().manual_seed(L); tt = time.time()
-            for step in range(1, a.steps + 1):
+            best, best_step, best_vals, traj = e0["delta_vsA"], 0, None, []
+            print(f"    steps {steps}" + (f" (schedule, PTQ {e0['delta_vsA']:.4f})" if a.steps_schedule else "")
+                  + (f", patience {a.patience}" if a.patience else ""), flush=True)
+            for step in range(1, steps + 1):
                 f = sched(step)
                 ex.opt.lr = a.lr_w * f; ex.opt.t = step
                 for pg, base in zip(opt_s.param_groups, (a.lr_s, a.lr_norm)): pg["lr"] = base * f
@@ -415,25 +520,37 @@ def main():
                 if step % 50 == 0:
                     print(f"    step {step:4d} loss {loss.item():.4f} A {lA.item():.4f} C {lC.item():.4f} "
                           f"R {lr_kl.item():.4f} ({time.time()-tt:.0f}s, peak {torch.cuda.max_memory_allocated()/2**30:.1f}G)", flush=True)
-                if step % a.eval_every == 0 or step == a.steps:
+                if step % a.eval_every == 0 or step == steps:
                     ev = evaluate()
+                    traj.append({"step": step, "delta_vsA": ev["delta_vsA"], "stream_vsC": ev["stream_vsC"]})
                     print(f"    [eval {step}] {fmt(ev)}", flush=True)
+                    if ev["delta_vsA"] < best - 1e-4:
+                        best, best_step = ev["delta_vsA"], step
+                        if a.patience:
+                            e = ex.export(); best_vals = {k: e[k].astype(np.float16) for k in ("gate", "up", "down")}; del e
+                    elif a.patience and step - best_step >= a.patience:
+                        print(f"    early stop at {step} (best {best:.4f} at {best_step})", flush=True)
+                        break
+                    del ev
             ex.opt = None
             # the last step's graph (loss -> ... -> TernaryMoE ctx) holds the optimizer state
             del loss, lA, lC, lcos, lr_kl, y, d, x, yA, yC, opt_s
+            ll["trajectory"] = traj; ll["best_step"] = best_step; ll["stopped_at"] = step
+            if best_vals is not None and best_step != step:
+                ex.load_values(best_vals)                 # back to the best evaluated state
+                print(f"    restored step {best_step}", flush=True)
+            del best_vals
             e1 = evaluate(); ll["trained"] = {k: v for k, v in e1.items() if k != "Y"}
+            if a.probe:
+                ll["trained"]["probe"] = probe(e1["Y"])
+                print(f"  trained probe: stream vsC after +1..+{a.probe} teacher layers {[round(v, 4) for v in ll['trained']['probe']]}", flush=True)
         else:
             e1 = e0
         # advance streams
         S_tr = run(student, runner, S_tr); S_va = e1["Y"]
         C_tr, C_va = Cx_tr, Cx_va
         exp = ex.export()
-        arrs = {k: exp[k].astype(np.float16) for k in ("gate", "up", "down")}
-        np.savez(out / f"experts_L{L}.npz", **arrs)
-        size, need = (out / f"experts_L{L}.npz").stat().st_size, sum(v.nbytes for v in arrs.values())
-        if size < need:                                          # a full disk truncates silently
-            raise RuntimeError(f"experts_L{L}.npz truncated: {size} < {need} bytes")
-        del arrs
+        save_experts(out / f"experts_L{L}.npz", {k: exp[k].astype(np.float16) for k in ("gate", "up", "down")})
         ll["exit_stream_vsC"] = rel(S_va, C_va)
         ll["zero_frac"] = float(sum((c == 0).float().mean() for c in exp["codes"].values()) / 3)
         print(f"  EXIT layer {L}: stream vs canonical relMSE {ll['exit_stream_vsC']:.4f}  zero {ll['zero_frac']:.3f}  ({time.time()-t0:.0f}s)", flush=True)
