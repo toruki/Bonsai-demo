@@ -117,11 +117,15 @@ def layer_weights(g: GGUFTensors, il: int, cfg) -> dict[str, torch.Tensor]:
     return {k: torch.from_numpy(np.ascontiguousarray(v, dtype=np.float32)) for k, v in out.items()}
 
 
-def build_layer(il: int, weights: dict[str, torch.Tensor], device="cuda", dtype=torch.float32):
+def build_layer(il: int, weights: dict[str, torch.Tensor], device="cuda", dtype=torch.float32, drop_experts=False):
+    """drop_experts: leave the routed experts out (an Identity placeholder) so their 10 GB of
+    uninitialised fp32 storage never reaches the device; the caller attaches its own module."""
     from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextDecoderLayer
     cfg = text_config()
     cfg._attn_implementation = "eager"
     mod = Qwen4ExpTextDecoderLayer(cfg, il)
+    if drop_experts:
+        mod.mlp.experts = torch.nn.Identity()
     missing, unexpected = mod.load_state_dict({k: v.to(dtype) for k, v in weights.items()}, strict=False)
     return mod.to(device=device, dtype=dtype).eval(), cfg, missing, unexpected
 

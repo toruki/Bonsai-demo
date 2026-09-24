@@ -226,6 +226,25 @@ layer 0–3 は元の IQ3_XXS のまま(PLE 入力の近似や未学習 PTQ を�
 | 全部 GPU | 32.0 GB(上限、共有メモリへ溢れる) | 210 t/s | 21 t/s |
 | layer 0–3 の expert を CPU(`-ot 'blk\.[0-3]\.ffn_(gate\|up\|down)_exps=CPU'`) | **28.6 GB** | 780 t/s | **76 t/s** |
 
+## 12. 学習時の VRAM(32 GB → 24 GB)
+
+layer 4、300 step、1024 系列での実測。delta relMSE はすべて 0.1125 で結果は変わらない。
+
+| | 修正前 | 16 bit Adam | 8 bit Adam | 8 bit + `--max-vram 24` |
+|---|---:|---:|---:|---:|
+| 学生構築までの peak(PyTorch) | 28.6 GB | 19.2 GB | 19.2 GB | 19.2 GB |
+| 学習中の peak(PyTorch) | 28.6 GB | 21.0 GB | 16.5 GB | 16.5 GB |
+| nvidia-smi peak(アイドル 0.8 GB 込み) | 32.0 GB | 32.0 GB | 32.0 GB | **24.1 GB** |
+| 1 層の所要時間 | — | 488 s | 543 s | 484 s |
+
+- 学生の構築で、使わない expert の器(fp32 10 GB)を GPU に載せてから差し替えていた → `build_layer(drop_experts=True)`
+- 層の終わりの `export()` が latent 全体を一度に fp32 で量子化していた → 32 expert ずつに分割
+- Adam の m / √v を int8 / uint8(128 要素ごとの fp32 scale)で保持(`--adam-bits 8`)。
+  scale を fp16 にすると勾配 ~1e-7 で underflow し、v だけが 0 になって発散した(delta 1.12)
+- 残る差(PyTorch の allocated に対して reserved が大きい)は caching allocator の断片化で、
+  `--max-vram` の上限でキャッシュを解放させて抑える。`expandable_segments` は WSL で
+  `CUDA driver error: device not ready` になり使えない
+
 ## 再現
 
 ```bash

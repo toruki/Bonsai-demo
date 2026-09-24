@@ -93,7 +93,7 @@ class FusedAdam:
     (10 GB) is never materialised, and m/v are kept in bf16 (10 GB instead of 20).
 
     state_bits=8 keeps them blockwise-quantised instead (5 GB): m as int8 and sqrt(v) as uint8,
-    one fp16 absmax scale per GROUP elements. Every step still computes m, v and the update in
+    one fp32 absmax scale per GROUP elements. Every step still computes m, v and the update in
     fp32; only the state carried to the next step is rounded. A carried sqrt(v) that rounds to 0
     is read back as half a quantisation step, so a tiny v cannot turn into a huge update."""
 
@@ -104,7 +104,9 @@ class FusedAdam:
             self.m = {k: torch.zeros_like(p, dtype=torch.bfloat16) for k, p in params.items()}
             self.v = {k: torch.zeros_like(p, dtype=torch.bfloat16) for k, p in params.items()}
         else:
-            sc = lambda p: torch.zeros(*p.shape[:-1], p.shape[-1] // GROUP, dtype=torch.float16, device=p.device)  # noqa: E731
+            # fp32 scales: gradients here are ~1e-7, so absmax/255 underflows fp16 and the carried v
+            # would silently become 0 while m survives, which blows the update up
+            sc = lambda p: torch.zeros(*p.shape[:-1], p.shape[-1] // GROUP, dtype=torch.float32, device=p.device)  # noqa: E731
             self.mq = {k: torch.zeros_like(p, dtype=torch.int8) for k, p in params.items()}
             self.vq = {k: torch.zeros_like(p, dtype=torch.uint8) for k, p in params.items()}
             self.ms = {k: sc(p) for k, p in params.items()}
@@ -128,13 +130,13 @@ class FusedAdam:
         if self.bits == 16:
             self.m[key][e].copy_(mf); self.v[key][e].copy_(vf); return
         mb = self._blocks(mf)
-        s = (mb.abs().amax(-1) / 127).to(torch.float16)
-        sf = s.float()[..., None].clamp(min=1e-30)
+        s = mb.abs().amax(-1) / 127
+        sf = s[..., None].clamp(min=1e-38)
         self.mq[key][e].copy_(torch.round(mb / sf).clamp_(-127, 127).reshape(mf.shape).to(torch.int8))
         self.ms[key][e].copy_(s)
         rb = self._blocks(vf.sqrt())
-        s = (rb.amax(-1) / 255).to(torch.float16)
-        sf = s.float()[..., None].clamp(min=1e-30)
+        s = rb.amax(-1) / 255
+        sf = s[..., None].clamp(min=1e-38)
         self.vq[key][e].copy_(torch.round(rb / sf).clamp_(0, 255).reshape(vf.shape).to(torch.uint8))
         self.vs[key][e].copy_(s)
 
@@ -251,14 +253,22 @@ class TernaryExperts(nn.Module):
             del v
 
     @torch.no_grad()
-    def export(self):
-        """folded ternary values per GGUF tensor ([E, rows, in] numpy float32) + codes."""
-        gu, gt, _ = quant(self.gu_lat, self.gu_s.half().float())
-        dn, dt, _ = quant(self.dn_lat, self.dn_s.half().float())
-        I = self.I
-        return {"gate": gu[:, :I].cpu().numpy(), "up": gu[:, I:].cpu().numpy(), "down": dn.cpu().numpy(),
-                "codes": {"gate": gt[:, :I].to(torch.int8).cpu(), "up": gt[:, I:].to(torch.int8).cpu(),
-                          "down": dt.to(torch.int8).cpu()}}
+    def export(self, chunk=32):
+        """folded ternary values per GGUF tensor ([E, rows, in] numpy fp16, exact: code * fp16 scale)
+        and the zero fraction; quantised `chunk` experts at a time so the device never holds a
+        full-size fp32 copy (that was the per-layer VRAM peak)."""
+        I, E = self.I, self.gu_lat.shape[0]
+        out = {"gate": [], "up": [], "down": []}; zeros = 0; total = 0
+        for e0 in range(0, E, chunk):
+            gu, gt, _ = quant(self.gu_lat[e0:e0 + chunk], self.gu_s[e0:e0 + chunk].half().float())
+            dn, dt, _ = quant(self.dn_lat[e0:e0 + chunk], self.dn_s[e0:e0 + chunk].half().float())
+            out["gate"].append(gu[:, :I].half().cpu().numpy()); out["up"].append(gu[:, I:].half().cpu().numpy())
+            out["down"].append(dn.half().cpu().numpy())
+            zeros += int((gt == 0).sum()) + int((dt == 0).sum()); total += gt.numel() + dt.numel()
+            del gu, gt, dn, dt
+        res = {k: np.concatenate(v) for k, v in out.items()}
+        res["zero_frac"] = zeros / total
+        return res
 
 
 class NextRouter:
@@ -359,6 +369,9 @@ def main():
     ap.add_argument("--probe", type=int, default=0,
                     help="also report the stream error after passing the student output (and the canonical one) "
                          "through the next N unmodified teacher layers, at PTQ init and after training")
+    ap.add_argument("--max-vram", type=float, default=0,
+                    help="cap this process's CUDA memory (GiB); the caching allocator then releases cached "
+                         "blocks instead of growing past it. 0 = no cap")
     ap.add_argument("--adam-bits", type=int, default=16, choices=[8, 16],
                     help="precision of the expert-latent Adam state (8 saves ~5 GB of VRAM)")
     ap.add_argument("--stream-dir", default="/data/eval/q4x_streams")
@@ -370,6 +383,8 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.manual_seed(0)
     dev = "cuda"
+    if a.max_vram:
+        torch.cuda.set_per_process_memory_fraction(min(1.0, a.max_vram * 2**30 / torch.cuda.get_device_properties(0).total_memory))
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     cfg = text_config(); width = cfg.hidden_size * cfg.hc_count
     runner = LayerRunner(cfg, dev)
@@ -407,7 +422,8 @@ def main():
             teacher, _, _, _ = build_layer(L, W, device=dev)
             C_tr, C_va = run(teacher, runner, C_tr), run(teacher, runner, C_va)
             del teacher; torch.cuda.empty_cache()
-            student, _, _, _ = build_layer(L, {k: v for k, v in W.items() if not k.startswith("mlp.experts.")}, device=dev)
+            student, _, _, _ = build_layer(L, {k: v for k, v in W.items() if not k.startswith("mlp.experts.")}, device=dev,
+                                          drop_experts=True)
             student.mlp.experts = TernaryExperts(W["mlp.experts.gate_up_proj"], W["mlp.experts.down_proj"], dev)
             del W
             student.mlp.experts.load_values(done)
@@ -423,7 +439,8 @@ def main():
         del teacher; torch.cuda.empty_cache()
         print(f"\n=== layer {L} ({cfg.layer_types[L]}) teachers {time.time()-t0:.0f}s", flush=True)
 
-        student, _, _, _ = build_layer(L, {k: v for k, v in W.items() if not k.startswith("mlp.experts.")}, device=dev)
+        student, _, _, _ = build_layer(L, {k: v for k, v in W.items() if not k.startswith("mlp.experts.")}, device=dev,
+                                          drop_experts=True)
         student.mlp.experts = TernaryExperts(W["mlp.experts.gate_up_proj"], W["mlp.experts.down_proj"], dev)
         del W
         for p in student.parameters():
@@ -435,6 +452,9 @@ def main():
             p.requires_grad_(True)
 
         nr = NextRouter(g, L + 1, cfg, runner, dev) if L + 1 < cfg.num_hidden_layers else None
+        print(f"  (student built: allocated {torch.cuda.memory_allocated()/2**30:.1f}G, "
+              f"peak so far {torch.cuda.max_memory_allocated()/2**30:.1f}G)", flush=True)
+        torch.cuda.reset_peak_memory_stats()
 
         @torch.no_grad()
         def evaluate():
@@ -552,7 +572,7 @@ def main():
         exp = ex.export()
         save_experts(out / f"experts_L{L}.npz", {k: exp[k].astype(np.float16) for k in ("gate", "up", "down")})
         ll["exit_stream_vsC"] = rel(S_va, C_va)
-        ll["zero_frac"] = float(sum((c == 0).float().mean() for c in exp["codes"].values()) / 3)
+        ll["zero_frac"] = float(exp["zero_frac"])
         print(f"  EXIT layer {L}: stream vs canonical relMSE {ll['exit_stream_vsC']:.4f}  zero {ll['zero_frac']:.3f}  ({time.time()-t0:.0f}s)", flush=True)
         log["layers"][str(L)] = ll
         json.dump(log, open(out / "log.json", "w"), indent=1)
