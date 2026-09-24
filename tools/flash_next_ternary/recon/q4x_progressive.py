@@ -253,6 +253,12 @@ def router_kl(lt, ls):
     return (F.softmax(lt, -1) * (F.log_softmax(lt, -1) - F.log_softmax(ls, -1))).sum(-1).mean()
 
 
+def router_logit_mse(lt, ls):
+    """||ls - lt||^2 / ||lt - mean_e(lt)||^2: relative error of the next router's logits,
+    which is what decides the top-k ranking (softmax KL barely sees near-ties at the k boundary)."""
+    return ((ls - lt) ** 2).sum() / ((lt - lt.mean(-1, keepdim=True)) ** 2).sum()
+
+
 def topk_change(lt, ls, k):
     """1 - |top-k(teacher) ∩ top-k(student)| / k, mean over tokens."""
     a, b = lt.topk(k, -1).indices, ls.topk(k, -1).indices
@@ -289,7 +295,9 @@ def main():
     ap.add_argument("--lr-norm", type=float, default=1e-4)
     ap.add_argument("--anchor", type=float, default=0.2)
     ap.add_argument("--router-kl", type=float, default=0.0,
-                    help="weight of KL(next-layer router | teacher output || student output); 0 = off")
+                    help="weight of the next-layer router term (teacher output vs student output); 0 = off")
+    ap.add_argument("--router-loss", choices=["kl", "mse"], default="kl",
+                    help="kl: softmax KL over all experts; mse: relative MSE of the router logits")
     ap.add_argument("--cos-weight", type=float, default=1.0)
     ap.add_argument("--eval-every", type=int, default=200)
     ap.add_argument("--train-dir", nargs="+", default=["/data/eval/q4x_act_train"],
@@ -357,18 +365,18 @@ def main():
             dA = rel(Y.float() - S_va.float(), A_va.float() - S_va.float())
             out = {"delta_vsA": dA, "stream_vsC": rel(Y, Cx_va), "Y": Y}
             if nr is not None:                     # next-layer routing: student vs teacher(same input) / canonical
-                kl = chA = chC = 0.0; n = 0
+                kl = lm = chA = chC = 0.0; n = 0
                 for i in range(0, Y.shape[0], 2):
                     ls = nr.logits(Y[i:i + 2].to(dev).float())
                     la = nr.logits(A_va[i:i + 2].to(dev).float()); lc = nr.logits(Cx_va[i:i + 2].to(dev).float())
-                    kl += float(router_kl(la, ls)); chA += topk_change(la, ls, nr.k); chC += topk_change(lc, ls, nr.k); n += 1
-                out.update(next_kl_vsA=kl / n, next_route_vsA=chA / n, next_route_vsC=chC / n)
+                    kl += float(router_kl(la, ls)); lm += float(router_logit_mse(la, ls)); chA += topk_change(la, ls, nr.k); chC += topk_change(lc, ls, nr.k); n += 1
+                out.update(next_kl_vsA=kl / n, next_logit_rel_vsA=lm / n, next_route_vsA=chA / n, next_route_vsC=chC / n)
             return out
 
         def fmt(e):
             s = f"delta vsA relMSE {e['delta_vsA']:.4f} | stream vsC relMSE {e['stream_vsC']:.4f}"
             if "next_kl_vsA" in e:
-                s += (f" | next router KL vsA {e['next_kl_vsA']:.4f} route chg vsA {e['next_route_vsA']:.4f}"
+                s += (f" | next router KL vsA {e['next_kl_vsA']:.4f} logit relMSE {e['next_logit_rel_vsA']:.4f} route chg vsA {e['next_route_vsA']:.4f}"
                       f" vsC {e['next_route_vsC']:.4f}")
             return s
         e0 = evaluate(); ll["ptq"] = {k: v for k, v in e0.items() if k != "Y"}
@@ -395,7 +403,7 @@ def main():
                 if a.router_kl > 0 and nr is not None:
                     with torch.no_grad():
                         lt = nr.logits(yA)
-                    lr_kl = router_kl(lt, nr.logits(y))
+                    lr_kl = (router_kl if a.router_loss == "kl" else router_logit_mse)(lt, nr.logits(y))
                     loss = loss + a.router_kl * lr_kl
                 opt_s.zero_grad(set_to_none=True)
                 loss.backward()                           # latents are updated inside backward

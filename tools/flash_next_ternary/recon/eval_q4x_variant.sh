@@ -2,7 +2,8 @@
 # Evaluate a Flash-Next variant whose routed experts in some layers were replaced by
 # trained/PTQ ternary values (experts_L{N}.npz from q4x_progressive.py).
 #   eval_q4x_variant.sh <name> <values-dir> <first> <last>      (name=base: IQ3_XXS reference only)
-# Writes PPL + KL (32 x 512 wikitext-2 test, vs the IQ3_XXS logits) and ffn_moe_topk dumps.
+# Writes PPL + KL (32 x 512 wikitext-2 test, vs the IQ3_XXS logits) and routing / MoE dumps
+# (8 x 512 tokens, into $RMASS_DIR/rmass_<name>, compared with rmass_base by routing_mass.py).
 set -uo pipefail
 export LD_LIBRARY_PATH=/usr/local/cuda-13.3/lib64
 NAME=$1; VAL=${2:-}; FIRST=${3:-0}; LAST=${4:-0}
@@ -27,21 +28,34 @@ else
   if [ -f $D/$S-00001-of-00003.gguf ] && [ -f $D/$S-00002-of-00003.gguf ] && [ -z "${REINJECT:-}" ]; then
     step "$NAME: model already built, skipping injection (REINJECT=1 to redo)"
   else
-  step "$NAME: inject shard 2 (layers $FIRST-$LAST)"
-  $PY -u $HERE/../gguf_inject_ternary.py --src $SRC/$S-00002-of-00003.gguf --dst $D/$S-00002-of-00003.gguf \
-      --layers $LAYERS --values-dir $VAL > $EV/inject_$NAME.log 2>&1 || { step "inject FAILED"; tail -5 $EV/inject_$NAME.log; exit 1; }
+  # routed experts of blk 0-17 live in shard 2, blk 18-47 in shard 3 (UD-IQ3_XXS split)
+  L2=""; L3=""; for l in $LAYERS; do if [ $l -le 17 ]; then L2="$L2 $l"; else L3="$L3 $l"; fi; done
+  : > $EV/inject_$NAME.log
+  for sh in 2 3; do
+    SL=$([ $sh = 2 ] && echo "$L2" || echo "$L3")
+    if [ -n "$SL" ]; then
+      step "$NAME: inject shard $sh (layers$SL)"
+      $PY -u $HERE/../gguf_inject_ternary.py --src $SRC/$S-0000$sh-of-00003.gguf --dst $D/$S-0000$sh-of-00003.gguf \
+          --layers $SL --values-dir $VAL >> $EV/inject_$NAME.log 2>&1 || { step "inject FAILED"; tail -5 $EV/inject_$NAME.log; exit 1; }
+    else
+      ln -sf $SRC/$S-0000$sh-of-00003.gguf $D/$S-0000$sh-of-00003.gguf
+    fi
+  done
   $PY -u $HERE/../gguf_inject_ternary.py --src $SRC/$S-00001-of-00003.gguf --dst $D/$S-00001-of-00003.gguf \
       --kv-only --names $N --widths 640 2560 >> $EV/inject_$NAME.log 2>&1 || { step "kv FAILED"; exit 1; }
-  ln -sf $SRC/$S-00003-of-00003.gguf $D/$S-00003-of-00003.gguf
   fi
   M=$D/$S-00001-of-00003.gguf
   step "$NAME: PPL + KL"
   $B/llama-perplexity -m $M -f $TXT -c 512 -b 512 --chunks 32 -ngl 12 --kl-divergence-base $KLB --kl-divergence > $EV/ppl_$NAME.log 2>&1
   grep -E "Final estimate|^Mean PPL|Mean *KLD|Same top" $EV/ppl_$NAME.log
 fi
-step "$NAME: routing dump"
-rm -rf $EV/route_$NAME
+step "$NAME: routing / MoE dump"
+# top-k, gate weights, full router softmax, routed-expert output and streams (routing_mass.py / moe_decompose.py)
+RM=${RMASS_DIR:-/data/eval}/rmass_$NAME; rm -rf $RM
 $T -m $M -f $TXT -c 512 -b 512 -ub 512 -ngl 12 --no-logits --n-chunks 8 --chunk-len 512 \
-   --dump-filter '^ffn_moe_topk-[0-9]+$' --dump-dir $EV/route_$NAME > $EV/route_$NAME.log 2>&1
-step "rc=$? $(ls $EV/route_$NAME | wc -l) files"
+   --dump-filter '^(ffn_moe_probs|ffn_moe_topk|ffn_moe_weights_norm|ffn_moe_out|l_last)-[0-9]+$' --dump-dir $RM > $RM.log 2>&1
+step "rc=$? $(ls $RM | wc -l) files"
+if [ "$NAME" != base ]; then
+  $PY $HERE/routing_mass.py ${RMASS_DIR:-/data/eval}/rmass_base $RM --first $FIRST --last $LAST --json $EV/rmass_$NAME.json | grep -E "^layer|^mean"
+fi
 step "EVAL $NAME END"
