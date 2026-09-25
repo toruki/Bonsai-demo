@@ -363,6 +363,10 @@ def main():
     ap.add_argument("--lr-w", type=float, default=2e-4)
     ap.add_argument("--lr-s", type=float, default=1e-4)
     ap.add_argument("--lr-norm", type=float, default=1e-4)
+    ap.add_argument("--lr-shared", type=float, default=0.0,
+                    help="also train the shared expert (+ its sigmoid gate) at this lr; 0 = frozen")
+    ap.add_argument("--lr-attn", type=float, default=0.0,
+                    help="also train the attention block (GDN / QSA) at this lr; 0 = frozen")
     ap.add_argument("--anchor", type=float, default=0.2)
     ap.add_argument("--router-kl", type=float, default=0.0,
                     help="weight of the next-layer router term (teacher output vs student output); 0 = off")
@@ -473,8 +477,15 @@ def main():
         ex = student.mlp.experts
         scl = [ex.gu_s, ex.dn_s]
         nrm = [student.attn_hyper_connection.hc_norm.weight, student.mlp_hyper_connection.hc_norm.weight]
-        for p in [ex.gu_lat, ex.dn_lat] + scl + nrm:
+        shr = [p for n, p in student.mlp.named_parameters() if n.startswith("shared_expert")] if a.lr_shared else []
+        att = list((student.linear_attn if student.layer_type == "linear_attention" else student.self_attn).parameters()) \
+            if a.lr_attn else []
+        for p in [ex.gu_lat, ex.dn_lat] + scl + nrm + shr + att:
             p.requires_grad_(True)
+        dense0 = {id(p): p.detach().clone() for p in nrm + shr + att}      # to report how far they moved
+        if shr or att:
+            print(f"  extra trainables: shared {sum(p.numel() for p in shr)/1e6:.1f}M @ {a.lr_shared}, "
+                  f"attn {sum(p.numel() for p in att)/1e6:.1f}M @ {a.lr_attn}", flush=True)
 
         nr = NextRouter(g, L + 1, cfg, runner, dev) if L + 1 < cfg.num_hidden_layers else None
         print(f"  (student built: allocated {torch.cuda.memory_allocated()/2**30:.1f}G, "
@@ -531,7 +542,8 @@ def main():
 
         if steps > 0:
             ex.opt = FusedAdam({"gu": ex.gu_lat, "dn": ex.dn_lat}, lr=a.lr_w, state_bits=a.adam_bits)
-            opt_s = torch.optim.AdamW([{"params": scl, "lr": a.lr_s}, {"params": nrm, "lr": a.lr_norm}], betas=(0.9, 0.99), weight_decay=0.0)
+            groups = [(scl, a.lr_s), (nrm, a.lr_norm)] + [(g_, lr_) for g_, lr_ in ((shr, a.lr_shared), (att, a.lr_attn)) if g_]
+            opt_s = torch.optim.AdamW([{"params": g_, "lr": lr_} for g_, lr_ in groups], betas=(0.9, 0.99), weight_decay=0.0)
             sched = lambda t: 0.5 * (1 + math.cos(math.pi * min(t, steps) / steps))  # noqa: E731
             gen = torch.Generator().manual_seed(L); tt = time.time()
             best, best_step, best_vals, traj = e0["delta_vsA"], 0, None, []
@@ -540,7 +552,7 @@ def main():
             for step in range(1, steps + 1):
                 f = sched(step)
                 ex.opt.lr = a.lr_w * f; ex.opt.t = step
-                for pg, base in zip(opt_s.param_groups, (a.lr_s, a.lr_norm)): pg["lr"] = base * f
+                for pg, (_, base) in zip(opt_s.param_groups, groups): pg["lr"] = base * f
                 ix = torch.randperm(S_tr.shape[0], generator=gen)[: a.bs]
                 x = S_tr[ix].to(dev).float(); yA = A_tr[ix].to(dev).float(); yC = Cx_tr[ix].to(dev).float()
                 y = runner(student, x).float()
@@ -559,6 +571,8 @@ def main():
                 loss.backward()                           # latents are updated inside backward
                 ex.gu_lat.grad = None; ex.dn_lat.grad = None
                 torch.nn.utils.clip_grad_norm_(scl + nrm, 1.0)
+                for g_ in (shr, att):
+                    if g_: torch.nn.utils.clip_grad_norm_(g_, 1.0)
                 opt_s.step()
                 with torch.no_grad():
                     for s in scl: s.clamp_(min=1e-6)
@@ -581,6 +595,12 @@ def main():
             # the last step's graph (loss -> ... -> TernaryMoE ctx) holds the optimizer state
             del loss, lA, lC, lcos, lr_kl, y, d, x, yA, yC, opt_s
             ll["trajectory"] = traj; ll["best_step"] = best_step; ll["stopped_at"] = step
+            with torch.no_grad():
+                for name, grp in (("norm", nrm), ("shared", shr), ("attn", att)):
+                    if grp:
+                        num = sum(float(((p - dense0[id(p)]) ** 2).sum()) for p in grp)
+                        den = sum(float((dense0[id(p)] ** 2).sum()) for p in grp)
+                        print(f"    moved {name}: |dW|/|W| = {math.sqrt(num / max(den, 1e-30)):.2e}", flush=True)
             if best_vals is not None and best_step != step:
                 ex.load_values(best_vals)                 # back to the best evaluated state
                 print(f"    restored step {best_step}", flush=True)
