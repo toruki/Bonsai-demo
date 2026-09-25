@@ -52,6 +52,25 @@ def pq2_0_quantize(x: np.ndarray) -> np.ndarray:
     return out
 
 
+def pq2_0_pack(codes: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    """explicit codes int8 [..., k] in {-1,0,1,2} + fp16 scale [..., k/128] -> uint8 [nb, 34] blocks.
+    Unlike pq2_0_quantize this keeps a code of +2 (no amax re-derivation)."""
+    q = (np.ascontiguousarray(codes, dtype=np.int16).reshape(-1, QK_PQ2_0) + 1)
+    if q.min() < 0 or q.max() > 3:
+        raise ValueError("PQ2_0 codes must lie in [-1, 2]")
+    q = q.astype(np.uint8)
+    d16 = np.ascontiguousarray(scale, dtype=np.float16).reshape(-1)
+    nb = q.shape[0]
+    assert d16.shape[0] == nb, (d16.shape, q.shape)
+    out = np.zeros((nb, PQ2_0_BLOCK_BYTES), dtype=np.uint8)
+    out[:, :2] = d16.view(np.uint8).reshape(nb, 2)
+    qs = np.zeros((nb, QK_PQ2_0 // 4), dtype=np.uint8)
+    for j in range(QK_PQ2_0):
+        qs[:, j // 4] |= (q[:, j] << ((j % 4) * 2))
+    out[:, 2:] = qs
+    return out
+
+
 def pq2_0_dequantize(blocks: np.ndarray) -> np.ndarray:
     """uint8 [nb, 34] -> float32 [nb*128]. Mirrors dequantize_row_pq2_0."""
     blocks = np.ascontiguousarray(blocks, dtype=np.uint8).reshape(-1, PQ2_0_BLOCK_BYTES)

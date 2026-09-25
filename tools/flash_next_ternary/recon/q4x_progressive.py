@@ -33,7 +33,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
 from bonsai_format import hadamard_matrix  # noqa: E402
 from gguf_inject_ternary import make_signs  # noqa: E402
-from ternary_store import load_experts, save_experts  # noqa: E402
+from ternary_store import load_experts, save_experts, values_from  # noqa: E402
 from latent_ckpt import save_latents  # noqa: E402
 from q4x_layer import FLASH_GGUF, GGUFTensors, LayerRunner, build_layer, layer_weights, text_config  # noqa: E402
 
@@ -73,17 +73,35 @@ def mseopt_scale(wf: torch.Tensor) -> torch.Tensor:
     return s.clamp(min=1e-8).reshape(*wf.shape[:-1], wf.shape[-1] // GROUP)
 
 
-def quant(lat, s):
-    """value of the ternary weight (no autograd); lat [..., n], s [..., n/GROUP]."""
+def mseopt_scale4(wf: torch.Tensor, n_cand: int = 121) -> torch.Tensor:
+    """per-group weight-MSE-optimal scale for the levels {-1,0,1,2} by grid search over
+    s = amax * c, c in [0.3, 1.5]; wf [..., G*k] -> [..., k]."""
+    g = wf.reshape(-1, GROUP)
+    amax = g.abs().amax(1, keepdim=True).clamp(min=1e-8)
+    c = torch.linspace(0.3, 1.5, n_cand, device=g.device, dtype=g.dtype)
+    best_s = amax[:, 0].clone(); best_e = torch.full_like(best_s, float("inf"))
+    for i in range(0, n_cand, 8):                                  # [n, 8, G] at a time
+        sc = amax * c[i:i + 8][None]                                # [n, m]
+        q = torch.clamp(torch.round(g[:, None, :] / sc[..., None]), -1, 2) * sc[..., None]
+        e = ((q - g[:, None, :]) ** 2).sum(-1)                      # [n, m]
+        em, im = e.min(1)
+        better = em < best_e
+        best_e = torch.where(better, em, best_e); best_s = torch.where(better, sc.gather(1, im[:, None])[:, 0], best_s)
+    return best_s.reshape(*wf.shape[:-1], wf.shape[-1] // GROUP)
+
+
+def quant(lat, s, hi=1):
+    """value of the quantised weight (no autograd); lat [..., n], s [..., n/GROUP].
+    hi=1: ternary {-1,0,1}; hi=2: the PQ2_0 levels {-1,0,1,2}."""
     u = lat.float().reshape(*lat.shape[:-1], -1, GROUP) / s[..., None]
-    t = torch.clamp(torch.round(u), -1, 1)
+    t = torch.clamp(torch.round(u), -1, hi)
     return (t * s[..., None]).reshape(lat.shape), t, u
 
 
-def ste_grads(gW, lat, s):
+def ste_grads(gW, lat, s, hi=1):
     """grads of the STE quantiser: d/dlat = inside; d/ds = sum_group gW * (t - inside*u)."""
-    _, t, u = quant(lat, s)
-    inside = (u.abs() <= 1.5).to(gW.dtype)
+    _, t, u = quant(lat, s, hi)
+    inside = ((u >= -1.5) & (u <= hi + 0.5)).to(gW.dtype)
     g = gW.reshape(*gW.shape[:-1], -1, GROUP)
     return (g * inside).reshape(gW.shape), (g * (t - inside * u)).sum(-1)
 
@@ -171,7 +189,7 @@ class TernaryMoE(torch.autograd.Function):
     instead of saved, and parameter grads are materialised once (not per expert)."""
 
     @staticmethod
-    def forward(ctx, x_rot, idx, wts, gu_lat, gu_s, dn_lat, dn_s, rot_i, I, opt):
+    def forward(ctx, x_rot, idx, wts, gu_lat, gu_s, dn_lat, dn_s, rot_i, I, opt, dn_hi=1):
         T = x_rot.shape[0]
         out = torch.zeros(T, dn_lat.shape[1], device=x_rot.device, dtype=x_rot.dtype)
         E = gu_lat.shape[0]
@@ -183,16 +201,16 @@ class TernaryMoE(torch.autograd.Function):
             gu = xe @ quant(gu_lat[e], gu_s[e])[0].t()
             g, u = gu[:, :I], gu[:, I:]
             h = F.silu(g) * u
-            ye = rot_i.fwd(h) @ quant(dn_lat[e], dn_s[e])[0].t()
+            ye = rot_i.fwd(h) @ quant(dn_lat[e], dn_s[e], dn_hi)[0].t()
             out.index_add_(0, ti, ye * wts[ti, pos, None])
         ctx.save_for_backward(x_rot, idx, wts, gu_lat, gu_s, dn_lat, dn_s)
-        ctx.rot_i, ctx.I, ctx.hit, ctx.mask, ctx.opt = rot_i, I, hit, mask, opt
+        ctx.rot_i, ctx.I, ctx.hit, ctx.mask, ctx.opt, ctx.dn_hi = rot_i, I, hit, mask, opt, dn_hi
         return out
 
     @staticmethod
     def backward(ctx, gout):
         x_rot, idx, wts, gu_lat, gu_s, dn_lat, dn_s = ctx.saved_tensors
-        rot_i, I = ctx.rot_i, ctx.I
+        rot_i, I, dn_hi = ctx.rot_i, ctx.I, ctx.dn_hi
         gx = torch.zeros_like(x_rot)
         gw = torch.zeros_like(wts)
         opt = ctx.opt
@@ -203,7 +221,7 @@ class TernaryMoE(torch.autograd.Function):
             pos, ti = torch.where(ctx.mask[e])
             xe = x_rot[ti]
             Wgu = quant(gu_lat[e], gu_s[e])[0]
-            Wdn = quant(dn_lat[e], dn_s[e])[0]
+            Wdn = quant(dn_lat[e], dn_s[e], dn_hi)[0]
             gu = xe @ Wgu.t()
             g, u = gu[:, :I], gu[:, I:]
             sg = F.silu(g)
@@ -215,7 +233,7 @@ class TernaryMoE(torch.autograd.Function):
             gw[ti, pos] = (go * ye).sum(-1)
             gye = go * w
             gWdn = gye.t() @ hr
-            a, b = ste_grads(gWdn, dn_lat[e], dn_s[e]); g_dns[e] += b
+            a, b = ste_grads(gWdn, dn_lat[e], dn_s[e], dn_hi); g_dns[e] += b
             gh = rot_i.bwd(gye @ Wdn)                     # uses Wdn before the latent moves
             if opt is None: g_dnl[e] += a
             else: opt.update("dn", dn_lat[e], e, a)
@@ -228,23 +246,24 @@ class TernaryMoE(torch.autograd.Function):
             gx.index_add_(0, ti, ggu @ Wgu)               # uses Wgu before the latent moves
             if opt is None: g_gul[e] += a
             else: opt.update("gu", gu_lat[e], e, a)
-        return gx, None, gw, g_gul, g_gus, g_dnl, g_dns, None, None, None
+        return gx, None, gw, g_gul, g_gus, g_dnl, g_dns, None, None, None, None
 
 
 class TernaryExperts(nn.Module):
     """Drop-in for Qwen4ExpTextExperts: folded ternary experts with learnable scales."""
 
-    def __init__(self, gate_up: torch.Tensor, down: torch.Tensor, device, latent_dtype=torch.float32):
+    def __init__(self, gate_up: torch.Tensor, down: torch.Tensor, device, latent_dtype=torch.float32, dn_hi=1):
         super().__init__()
         E, twoI, H = gate_up.shape
-        self.I = twoI // 2
+        self.I, self.dn_hi = twoI // 2, dn_hi
+        dn_scale = mseopt_scale if dn_hi == 1 else mseopt_scale4
         self.rot_h, self.rot_i = Rot(H, device), Rot(self.I, device)
         gl, gs, dl, ds = [], [], [], []
         with torch.no_grad():
             for e0 in range(0, E, 32):                       # fold + scale init in chunks
                 gf = self.rot_h.fold(gate_up[e0:e0 + 32].to(device))
                 df = self.rot_i.fold(down[e0:e0 + 32].to(device))
-                gs.append(mseopt_scale(gf)); ds.append(mseopt_scale(df))
+                gs.append(mseopt_scale(gf)); ds.append(dn_scale(df))
                 gl.append(gf.to(latent_dtype)); dl.append(df.to(latent_dtype)); del gf, df
         self.gu_lat = nn.Parameter(torch.cat(gl)); self.gu_s = nn.Parameter(torch.cat(gs))
         self.dn_lat = nn.Parameter(torch.cat(dl)); self.dn_s = nn.Parameter(torch.cat(ds))
@@ -253,7 +272,7 @@ class TernaryExperts(nn.Module):
     def forward(self, hidden_states, top_k_index, top_k_weights):
         x_rot = self.rot_h.fwd(hidden_states)
         return TernaryMoE.apply(x_rot, top_k_index, top_k_weights, self.gu_lat, self.gu_s,
-                                self.dn_lat, self.dn_s, self.rot_i, self.I, self.opt)
+                                self.dn_lat, self.dn_s, self.rot_i, self.I, self.opt, self.dn_hi)
 
     @torch.no_grad()
     def load_values(self, src):
@@ -261,11 +280,17 @@ class TernaryExperts(nn.Module):
         same gate/up/down arrays), so that quant(lat, s) reproduces them exactly:
         s = |value| of each group (1 for all-zero groups)."""
         z = load_experts(src) if isinstance(src, (str, Path)) else src
-        for lat, sc, v in ((self.gu_lat, self.gu_s, np.concatenate([z["gate"], z["up"]], axis=1)),
-                           (self.dn_lat, self.dn_s, z["down"])):
+        for lat, sc, v, k in ((self.gu_lat, self.gu_s, np.concatenate([z["gate"], z["up"]], axis=1), ("gate", "up")),
+                              (self.dn_lat, self.dn_s, z["down"], ("down",))):
+            explicit = all(f"{n}_scale" in z for n in k)          # v2 store: scales are stored, not re-derived
+            if explicit:
+                s_all = np.concatenate([z[f"{n}_scale"] for n in k], axis=1) if len(k) > 1 else z[f"{k[0]}_scale"]
             for e0 in range(0, lat.shape[0], 32):
                 w = torch.from_numpy(v[e0:e0 + 32]).to(lat.device).float()
-                g = w.abs().reshape(*w.shape[:-1], -1, GROUP).amax(-1)
+                if explicit:
+                    g = torch.from_numpy(np.asarray(s_all[e0:e0 + 32], np.float32)).to(lat.device)
+                else:
+                    g = w.abs().reshape(*w.shape[:-1], -1, GROUP).amax(-1)
                 lat[e0:e0 + 32] = w; sc[e0:e0 + 32] = torch.where(g > 0, g, torch.ones_like(g))
             del v
 
@@ -275,15 +300,22 @@ class TernaryExperts(nn.Module):
         and the zero fraction; quantised `chunk` experts at a time so the device never holds a
         full-size fp32 copy (that was the per-layer VRAM peak)."""
         I, E = self.I, self.gu_lat.shape[0]
-        out = {"gate": [], "up": [], "down": []}; zeros = 0; total = 0
+        out = {"gate": [], "up": [], "down": []}; codes = {"gate": [], "up": [], "down": []}; zeros = 0; total = 0
         for e0 in range(0, E, chunk):
-            gu, gt, _ = quant(self.gu_lat[e0:e0 + chunk], self.gu_s[e0:e0 + chunk].half().float())
-            dn, dt, _ = quant(self.dn_lat[e0:e0 + chunk], self.dn_s[e0:e0 + chunk].half().float())
+            gs, ds = self.gu_s[e0:e0 + chunk].half().float(), self.dn_s[e0:e0 + chunk].half().float()
+            gu, gt, _ = quant(self.gu_lat[e0:e0 + chunk], gs)
+            dn, dt, _ = quant(self.dn_lat[e0:e0 + chunk], ds, self.dn_hi)
             out["gate"].append(gu[:, :I].half().cpu().numpy()); out["up"].append(gu[:, I:].half().cpu().numpy())
             out["down"].append(dn.half().cpu().numpy())
+            gt = gt.to(torch.int8).reshape(gu.shape); dt = dt.to(torch.int8).reshape(dn.shape)
+            codes["gate"].append(gt[:, :I].cpu().numpy()); codes["up"].append(gt[:, I:].cpu().numpy())
+            codes["down"].append(dt.cpu().numpy())
             zeros += int((gt == 0).sum()) + int((dt == 0).sum()); total += gt.numel() + dt.numel()
             del gu, gt, dn, dt
         res = {k: np.concatenate(v) for k, v in out.items()}
+        res["codes"] = {k: np.concatenate(v) for k, v in codes.items()}
+        res["scales"] = {"gate": self.gu_s[:, :I // GROUP].half().cpu().numpy(), "up": self.gu_s[:, I // GROUP:].half().cpu().numpy(),
+                         "down": self.dn_s.half().cpu().numpy()}
         res["zero_frac"] = zeros / total
         return res
 
@@ -393,6 +425,8 @@ def main():
     ap.add_argument("--max-vram", type=float, default=0,
                     help="cap this process's CUDA memory (GiB); the caching allocator then releases cached "
                          "blocks instead of growing past it. 0 = no cap")
+    ap.add_argument("--down-levels", type=int, default=3, choices=[3, 4],
+                    help="4: the down projection uses the PQ2_0 levels {-1,0,1,2} (2 bit) instead of ternary")
     ap.add_argument("--latent-dtype", default="fp32", choices=list(LATENT_DTYPES),
                     help="storage of the expert latents; fp16/bf16 halve their VRAM and are updated with "
                          "stochastic rounding")
@@ -452,7 +486,7 @@ def main():
             student, _, _, _ = build_layer(L, {k: v for k, v in W.items() if not k.startswith("mlp.experts.")}, device=dev,
                                           drop_experts=True)
             student.mlp.experts = TernaryExperts(W["mlp.experts.gate_up_proj"], W["mlp.experts.down_proj"], dev,
-                                                 latent_dtype=LATENT_DTYPES[a.latent_dtype])
+                                                 latent_dtype=LATENT_DTYPES[a.latent_dtype], dn_hi=a.down_levels - 2)
             del W
             student.mlp.experts.load_values(done)
             S_tr, S_va = run(student, runner, S_tr), run(student, runner, S_va)
@@ -470,7 +504,7 @@ def main():
         student, _, _, _ = build_layer(L, {k: v for k, v in W.items() if not k.startswith("mlp.experts.")}, device=dev,
                                           drop_experts=True)
         student.mlp.experts = TernaryExperts(W["mlp.experts.gate_up_proj"], W["mlp.experts.down_proj"], dev,
-                                                 latent_dtype=LATENT_DTYPES[a.latent_dtype])
+                                                 latent_dtype=LATENT_DTYPES[a.latent_dtype], dn_hi=a.down_levels - 2)
         del W
         for p in student.parameters():
             p.requires_grad_(False)
@@ -586,7 +620,7 @@ def main():
                     if ev["delta_vsA"] < best - 1e-4:
                         best, best_step = ev["delta_vsA"], step
                         if a.patience:
-                            e = ex.export(); best_vals = {k: e[k].astype(np.float16) for k in ("gate", "up", "down")}; del e
+                            e = ex.export(); best_vals = values_from(e["codes"], e["scales"]); del e
                     elif a.patience and step - best_step >= a.patience:
                         print(f"    early stop at {step} (best {best:.4f} at {best_step})", flush=True)
                         break
@@ -618,7 +652,7 @@ def main():
             Path(a.save_latents).mkdir(parents=True, exist_ok=True)
             save_latents(Path(a.save_latents) / f"latents_L{L}.npz", ex)
         exp = ex.export()
-        save_experts(out / f"experts_L{L}.npz", {k: exp[k].astype(np.float16) for k in ("gate", "up", "down")})
+        save_experts(out / f"experts_L{L}.npz", exp["codes"], exp["scales"])
         ll["exit_stream_vsC"] = rel(S_va, C_va)
         ll["zero_frac"] = float(exp["zero_frac"])
         print(f"  EXIT layer {L}: stream vs canonical relMSE {ll['exit_stream_vsC']:.4f}  zero {ll['zero_frac']:.3f}  ({time.time()-t0:.0f}s)", flush=True)

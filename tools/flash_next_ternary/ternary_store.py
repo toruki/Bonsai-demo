@@ -1,9 +1,12 @@
-"""Compact on-disk store for trained ternary expert values (experts_L{N}.npz).
+"""Compact on-disk store for trained expert values (experts_L{N}.npz).
 
-The values are code * scale with code in {-1, 0, 1} and one fp16 scale per group of 128 along the
-input axis, so they are kept as 2-bit codes (4 per byte) plus the fp16 scales: ~0.6 GiB per
-Flash-Next layer instead of 4.8 GiB of fp16 values. load_experts() reads both this format and the
-older one (plain fp16 `gate`/`up`/`down` arrays).
+Values are code * scale with a fp16 scale per group of GROUP along the input axis and codes in
+{-1, 0, 1} (ternary) or {-1, 0, 1, 2} (the PQ2_0 levels). They are kept as 2-bit codes (4 per byte,
+stored as code + 1) plus the fp16 scales: ~0.6 GiB per Flash-Next layer.
+
+v2 files (`codes` + `scale` per tensor) store the scales explicitly, so a code of +2 survives; the older
+v1 files derived the scale from the values (amax), which only works for ternary. load_experts() reads
+both and returns the values plus, for v2, the codes and scales.
 """
 from __future__ import annotations
 
@@ -15,63 +18,71 @@ GROUP = 128
 NAMES = ("gate", "up", "down")
 
 
-def _pack(v: np.ndarray):
-    """fp16/fp32 values [..., n] -> (packed codes uint8, scales fp16 [..., n/GROUP]); exact or raises."""
-    g = v.astype(np.float32).reshape(*v.shape[:-1], -1, GROUP)
-    s = np.abs(g).max(-1).astype(np.float16)
-    sf = s.astype(np.float32)[..., None]
-    code = np.where(sf > 0, np.rint(g / np.where(sf > 0, sf, 1)), 0).astype(np.int8)
-    if not np.array_equal(code.astype(np.float32) * sf, g):
-        raise ValueError("values are not code * fp16 group scale")
-    c = (code.reshape(-1) + 1).astype(np.uint8)                   # 0, 1, 2
+def _pack_codes(code: np.ndarray) -> np.ndarray:
+    """int8 codes in [-1, 2] -> uint8, 4 per byte (stored as code + 1)."""
+    c = (code.reshape(-1).astype(np.int16) + 1)
+    if c.min() < 0 or c.max() > 3:
+        raise ValueError("codes must lie in [-1, 2]")
+    c = c.astype(np.uint8)
     c = np.concatenate([c, np.zeros((-c.size) % 4, np.uint8)])
-    packed = c[0::4] | (c[1::4] << 2) | (c[2::4] << 4) | (c[3::4] << 6)
-    return packed, s
+    return c[0::4] | (c[1::4] << 2) | (c[2::4] << 4) | (c[3::4] << 6)
 
 
-def _unpack(packed: np.ndarray, s: np.ndarray, shape) -> np.ndarray:
+def _unpack_codes(packed: np.ndarray, shape) -> np.ndarray:
     n = int(np.prod(shape))
     c = np.empty(packed.size * 4, np.int8)
     for j in range(4):
         c[j::4] = (packed >> (2 * j)) & 3
-    code = (c[:n] - 1).reshape(*shape[:-1], -1, GROUP)
-    return (code.astype(np.float16) * s[..., None]).reshape(shape)
+    return (c[:n] - 1).reshape(shape)
 
 
-def save_experts(path: Path, values: dict) -> None:
-    """values: {'gate','up','down'} -> arrays of ternary values. Verifies the written size."""
-    arrs = {}
+def values_from(codes: dict, scales: dict) -> dict:
+    """{'gate','up','down'} codes [..., n] + fp16 scales [..., n/GROUP] -> fp16 values."""
+    out = {}
     for k in NAMES:
-        v = values[k]
-        p, s = _pack(v)
-        arrs[f"{k}_codes"], arrs[f"{k}_scale"], arrs[f"{k}_shape"] = p, s, np.array(v.shape, np.int64)
+        c, s = codes[k], np.asarray(scales[k], np.float16)
+        out[k] = (c.reshape(*c.shape[:-1], -1, GROUP).astype(np.float16) * s[..., None]).reshape(c.shape)
+    return out
+
+
+def save_experts(path, codes: dict, scales: dict) -> None:
+    """v2: explicit codes + fp16 scales per tensor. Verifies the written size."""
+    arrs = {"version": np.array(2)}
+    for k in NAMES:
+        c = np.asarray(codes[k], np.int8)
+        arrs[f"{k}_codes"], arrs[f"{k}_scale"] = _pack_codes(c), np.asarray(scales[k], np.float16)
+        arrs[f"{k}_shape"] = np.array(c.shape, np.int64)
+    path = Path(path)
     np.savez(path, **arrs)
-    size, need = Path(path).stat().st_size, sum(a.nbytes for a in arrs.values())
-    if size < need:                                               # a full disk truncates silently
-        raise RuntimeError(f"{path} truncated: {size} < {need} bytes")
+    need = sum(a.nbytes for a in arrs.values())
+    if path.stat().st_size < need:                                 # a full disk truncates silently
+        raise RuntimeError(f"{path} truncated: {path.stat().st_size} < {need} bytes")
 
 
-def load_experts(path: Path) -> dict:
-    """-> {'gate','up','down'}: fp16 ternary values (either on-disk format)."""
+def load_experts(path) -> dict:
+    """-> {'gate','up','down'}: fp16 values; v2 files also carry '<k>_codes' (int8) and '<k>_scale' (fp16)."""
     z = np.load(path)
-    if "gate" in z.files:
+    if "gate" in z.files:                                          # v0: plain fp16 values
         return {k: z[k] for k in NAMES}
-    return {k: _unpack(z[f"{k}_codes"], z[f"{k}_scale"], tuple(z[f"{k}_shape"])) for k in NAMES}
+    out = {}
+    v2 = "version" in z.files
+    for k in NAMES:
+        shape = tuple(z[f"{k}_shape"])
+        c, s = _unpack_codes(z[f"{k}_codes"], shape), z[f"{k}_scale"]
+        out[k] = (c.reshape(*shape[:-1], -1, GROUP).astype(np.float16) * s[..., None]).reshape(shape)
+        if v2:
+            out[f"{k}_codes"], out[f"{k}_scale"] = c, s
+    return out
 
 
 if __name__ == "__main__":
-    # convert old fp16 stores in place, verifying the round trip: python ternary_store.py DIR...
-    import sys
-    for d in sys.argv[1:]:
-        for f in sorted(Path(d).glob("experts_L*.npz")):
-            z = np.load(f)
-            if "gate" not in z.files:
-                print(f"{f}: already packed"); continue
-            old = {k: z[k] for k in NAMES}
-            tmp = f.with_suffix(".packed.npz")
-            save_experts(tmp, old)
-            new = load_experts(tmp)
-            assert all(np.array_equal(old[k], new[k]) for k in NAMES), f
-            before = f.stat().st_size
-            tmp.replace(f)
-            print(f"{f}: {before / 2**30:.2f} -> {f.stat().st_size / 2**30:.2f} GiB (round trip exact)", flush=True)
+    # self-test of the v2 round trip, including +2 codes
+    rng = np.random.default_rng(0)
+    codes = {"gate": rng.integers(-1, 2, (3, 8, 256), dtype=np.int8), "up": rng.integers(-1, 2, (3, 8, 256), dtype=np.int8),
+             "down": rng.integers(-1, 3, (3, 256, 128), dtype=np.int8)}
+    scales = {k: rng.random(c.shape[:-1] + (c.shape[-1] // GROUP,)).astype(np.float16) for k, c in codes.items()}
+    save_experts("/tmp/ts_selftest.npz", codes, scales)
+    z = load_experts("/tmp/ts_selftest.npz"); v = values_from(codes, scales)
+    ok = all(np.array_equal(z[k], v[k]) and np.array_equal(z[f"{k}_codes"], codes[k]) and np.array_equal(z[f"{k}_scale"], scales[k])
+             for k in NAMES)
+    print("v2 round trip exact:", ok, "| down has +2:", bool((z["down_codes"] == 2).any()))

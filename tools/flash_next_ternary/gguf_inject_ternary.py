@@ -28,7 +28,7 @@ import gguf  # noqa: E402
 from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType  # noqa: E402
 from gguf.quants import dequantize, quant_shape_to_byte_shape  # noqa: E402
 
-from bonsai_format import hadamard_matrix, ptq1_0_quantize  # noqa: E402
+from bonsai_format import hadamard_matrix, pq2_0_pack, ptq1_0_quantize  # noqa: E402
 from ternary_store import load_experts  # noqa: E402
 
 
@@ -149,6 +149,17 @@ def main() -> None:
             _cache[layer] = load_experts(Path(a.values_dir) / f"experts_L{layer}.npz")
         return _cache[layer]
 
+    def planned_type(name: str):
+        """PQ2_0 for a trained tensor whose codes use +2, PTQ1_0 otherwise (decided before writing
+        the tensor table, since the byte shape depends on it)."""
+        if a.values_dir:
+            m = re.match(r"blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$", name)
+            if m:
+                tv = trained_values(int(m.group(1)))
+                if f"{m.group(2)}_codes" in tv and tv[f"{m.group(2)}_codes"].max() > 1:
+                    return GGMLQuantizationType.PQ2_0
+        return GGMLQuantizationType.PTQ1_0
+
     def convert(t):
         """Fold + ternarize + pack, in chunks along the outermost axis.
 
@@ -164,11 +175,17 @@ def main() -> None:
             m = re.match(r"blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$", t.name)
             if not m:
                 raise SystemExit(f"--values-dir has nothing for {t.name}")
-            y = trained_values(int(m.group(1)))[m.group(2)].astype(np.float32)
+            tv = trained_values(int(m.group(1))); key = m.group(2)
+            y = tv[key].astype(np.float32)
             assert y.shape == logical, (t.name, y.shape, logical)
+            if f"{key}_codes" in tv and tv[f"{key}_codes"].max() > 1:
+                # trained 4-level values (a code of +2): pack the explicit codes + scales as PQ2_0
+                packed = pq2_0_pack(tv[f"{key}_codes"], tv[f"{key}_scale"]).reshape(
+                    quant_shape_to_byte_shape(logical, GGMLQuantizationType.PQ2_0))
+                return packed, float((y == 0).mean()), float("nan"), GGMLQuantizationType.PQ2_0
             parts = [ptq1_0_quantize(y[i:i + 16]) for i in range(0, y.shape[0], 16)]
             packed = np.concatenate(parts).reshape(quant_shape_to_byte_shape(logical, GGMLQuantizationType.PTQ1_0))
-            return packed, float((y == 0).mean()), float("nan")
+            return packed, float((y == 0).mean()), float("nan"), GGMLQuantizationType.PTQ1_0
         inner = int(np.prod(logical[1:])) if len(logical) > 1 else 1
         step = max(1, (1 << 28) // max(inner * 4, 1))      # ~256 MB of f32 per chunk
         parts, err, ref, zeros, count = [], 0.0, 0.0, 0, 0
@@ -185,15 +202,16 @@ def main() -> None:
             parts.append(ptq1_0_quantize(y))
             del y
         packed = np.concatenate(parts).reshape(quant_shape_to_byte_shape(logical, GGMLQuantizationType.PTQ1_0))
-        return packed, zeros / count, err / ref
+        return packed, zeros / count, err / ref, GGMLQuantizationType.PTQ1_0
 
     for t in r.tensors:
         if a.kv_only or not targeted(t.name):
             w.add_tensor_info(t.name, t.data.shape, t.data.dtype, t.data.nbytes, t.tensor_type)
             continue
         logical = tuple(int(x) for x in t.shape)[::-1]
-        bshape = quant_shape_to_byte_shape(logical, GGMLQuantizationType.PTQ1_0)
-        w.add_tensor_info(t.name, bshape, np.dtype(np.uint8), int(np.prod(bshape)), GGMLQuantizationType.PTQ1_0)
+        ttype = planned_type(t.name)
+        bshape = quant_shape_to_byte_shape(logical, ttype)
+        w.add_tensor_info(t.name, bshape, np.dtype(np.uint8), int(np.prod(bshape)), ttype)
 
     w.write_header_to_file()
     w.write_kv_data_to_file()
@@ -203,9 +221,9 @@ def main() -> None:
     last_sync = 0
     for i, t in enumerate(r.tensors):
         if not a.kv_only and targeted(t.name):
-            packed, zero, rel = convert(t)
+            packed, zero, rel, ttype = convert(t)
             w.write_tensor_data(packed, tensor_endianess=r.endianess)
-            print(f"  {t.name:34s} {t.tensor_type.name:7s} {[int(x) for x in t.shape]} -> PTQ1_0  "
+            print(f"  {t.name:34s} {t.tensor_type.name:7s} {[int(x) for x in t.shape]} -> {ttype.name:6s} "
                   f"zero={zero:.3f} relMSE={rel:.4f}", flush=True)
             del packed
         else:

@@ -193,7 +193,7 @@ def main():
         S_va = e1["Y2"]; C_tr, C_va = Cx2_tr, Cx2_va
         for Lx, ex in ((L, ex0), (L + 1, ex1)):
             exp = ex.export()
-            save_experts(out / f"experts_L{Lx}.npz", {k: exp[k] for k in ("gate", "up", "down")})
+            save_experts(out / f"experts_L{Lx}.npz", exp["codes"], exp["scales"])
             log["layers"][str(Lx)] = {"block": [L, L + 1], "zero_frac": float(exp["zero_frac"]),
                                       "exit_stream_vsC": e1["exit1_vsC"] if Lx == L else e1["exit2_vsC"]}
             del exp
