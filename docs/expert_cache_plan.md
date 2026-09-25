@@ -240,3 +240,22 @@ layer 0 は他より散る(picks の 50 % / 90 % を 82 / 282 expert)。中間�
 - 256k 予算(8,175 slot)で miss 80 MiB/token を PCIe で転送すると +3–5 ms/token の見込み。
 - したがって host 制御の M1 は約 24 ms/token(約 40 t/s)が上限の目安で、133 t/s 級に戻すには
   M3(device 側 lookup/copy、同期なし)が必須。M1 は正しさと 256k 動作の確認に位置付ける。
+
+
+## M1 の実装と検証(2026-09-26、fork commit abb11c9e6)
+
+`--expert-cache-slots N`(`--cpu-moe` を暗黙に付ける)。`src/llama-expert-cache.{h,cpp}`(約 230 行)+
+`build_moe_ffn` の分岐(n_tokens == 1 のとき、top-k id を `ggml_map_custom1` の CPU op で slot id に写像し、
+3 本の bank tensor に対して既存の `mul_mat_id`)。routing weight は元の id のまま。
+
+- **正しさ**: layer 36–47 を bank 経由にした場合と、同じ層を GPU 常駐にした場合(同じ CUDA kernel)で
+  4 chunk × 512 token の単 token decode を比較 → **KL 0.000000(最大 4.9e-5)、PPL 同一**。
+  PPL は slot 数(2,000 / 4,000 / 6,000 / 8,175)によらず同一 = eviction による不整合なし。
+- 参考: CPU expert path(`-cmoe`)と GPU path は数値が異なる(KL 0.042、top-1 一致 94 %)。
+  これは kernel の差で cache の問題ではないが、CPU 側の量子化 matmul の精度として要注意。
+- unsloth UD-IQ3_XXS は layer 2 だけ gate/up が IQ3_S(他は IQ2_S)なので layer 2 は cache 対象外(CPU で計算)。
+- **速度**(8,175 slot、コード corpus、2048 token prompt の後 512 token): **34 ms/token(29 t/s)**、p95 53 ms。
+  M0 の見積もり(同期 12.5 ms + 転送)どおりで、pageable memory からの H2D が残りの大半。
+- prefill(expert は CPU、op offload が層ごとに重みを GPU へ流す): ub 512 で 158 t/s、**ub 2048 で 569 t/s**。
+  256k は約 8–10 分の見込み(attention の増分は別)。
+- VRAM: 8,175 slot + c 512 で 21.6 GB。

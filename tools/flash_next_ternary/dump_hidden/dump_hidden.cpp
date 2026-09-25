@@ -192,10 +192,19 @@ int main(int argc, char ** argv) {
         // prompt = first sequence in one batch, then greedy decode one token at a time
         const auto & sq = seqs.at(0);
         llama_memory_clear(llama_get_memory(ctx), true);
-        llama_batch batch = llama_batch_init((int) sq.size(), 0, 1);
-        for (size_t i = 0; i < sq.size(); ++i) common_batch_add(batch, sq[i], (llama_pos) i, {0}, i + 1 == sq.size());
-        if (llama_decode(ctx, batch)) { LOG_ERR("prompt decode failed\n"); return 1; }
-        llama_batch_free(batch);
+        // prompt in n_batch-sized pieces (the last token of the prompt requests logits)
+        const auto tp0 = std::chrono::steady_clock::now();
+        const size_t nb = (size_t) std::max(1, params.n_batch);
+        for (size_t start = 0; start < sq.size(); start += nb) {
+            const size_t n = std::min(nb, sq.size() - start);
+            llama_batch batch = llama_batch_init((int) n, 0, 1);
+            for (size_t i = 0; i < n; ++i) common_batch_add(batch, sq[start + i], (llama_pos) (start + i), {0}, start + i + 1 == sq.size());
+            if (llama_decode(ctx, batch)) { LOG_ERR("prompt decode failed at %zu\n", start); return 1; }
+            llama_batch_free(batch);
+            if ((start / nb) % 16 == 15) LOG_INF("  prefill %zu / %zu tokens\n", start + n, sq.size());
+        }
+        const double prompt_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
+        LOG_INF("PREFILL %zu tokens in %.1f s (%.1f t/s)\n", sq.size(), prompt_s, sq.size() / prompt_s);
         llama_pos pos = (llama_pos) sq.size();
         const int warm = 8;
         double total_ms = 0; std::vector<double> lat;
