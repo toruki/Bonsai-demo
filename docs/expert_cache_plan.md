@@ -259,3 +259,12 @@ layer 0 は他より散る(picks の 50 % / 90 % を 82 / 282 expert)。中間�
 - prefill(expert は CPU、op offload が層ごとに重みを GPU へ流す): ub 512 で 158 t/s、**ub 2048 で 569 t/s**。
   256k は約 8–10 分の見込み(attention の増分は別)。
 - VRAM: 8,175 slot + c 512 で 21.6 GB。
+
+### 256k end-to-end(M1 の契約)
+`dump_hidden --decode-timing`(262,000 token のコードを ub 1024 で prefill → 64 token を decode)、7,000 slot:
+- prefill **262k token を 1,535 s(25.6 分、平均 171 t/s)**。4k での 569 t/s(ub 2048)より遅いのは、
+  context が伸びるほど QSA attention / indexer の分が増えるためと、ub 1024 のため。
+- decode at 256k: **101 ms/token(9.9 t/s)**、p95 120 ms。短い context の 34 ms との差は attention 側の
+  費用(GPU 常駐の ternary-44 で同条件を測って切り分け中)。
+- VRAM peak **31.8 GB** — 上限に張り付いた。7,000 slot(13.1 GB)+ KV 6 GB + indexer 2.3 GB + ub 1024 の
+  compute で余裕がない。256k では slot を 5,500 程度に落とすか、indexer KV の K-only 化(約 2 GB)が要る。
