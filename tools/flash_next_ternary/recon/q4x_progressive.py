@@ -38,6 +38,7 @@ from q4x_layer import FLASH_GGUF, GGUFTensors, LayerRunner, build_layer, layer_w
 
 BLOCK = 128
 GROUP = 128
+LATENT_DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
 
 
 # ------------------------------------------------------------ rotation helpers
@@ -73,7 +74,7 @@ def mseopt_scale(wf: torch.Tensor) -> torch.Tensor:
 
 def quant(lat, s):
     """value of the ternary weight (no autograd); lat [..., n], s [..., n/GROUP]."""
-    u = lat.reshape(*lat.shape[:-1], -1, GROUP) / s[..., None]
+    u = lat.float().reshape(*lat.shape[:-1], -1, GROUP) / s[..., None]
     t = torch.clamp(torch.round(u), -1, 1)
     return (t * s[..., None]).reshape(lat.shape), t, u
 
@@ -87,6 +88,16 @@ def ste_grads(gW, lat, s):
 
 
 # ------------------------------------------------------- fused ternary MoE op
+
+def stochastic_round(x: torch.Tensor, dtype) -> torch.Tensor:
+    """fp32 -> fp16/bf16, rounding up or down with probability given by the distance, so updates
+    smaller than the target spacing survive on average (a plain cast would drop them)."""
+    mant = 10 if dtype == torch.float16 else 7
+    emin = -14 if dtype == torch.float16 else -126
+    e = torch.floor(torch.log2(x.abs().clamp(min=2.0 ** emin)))
+    ulp = torch.exp2(e - mant)
+    return (x + (torch.rand_like(x) - 0.5) * ulp).to(dtype)
+
 
 class FusedAdam:
     """Adam applied per expert inside TernaryMoE.backward: the full-size latent gradient
@@ -147,7 +158,11 @@ class FusedAdam:
         vf.mul_(self.b2).addcmul_(grad, grad, value=1 - self.b2)
         self._store(key, e, mf, vf)
         bc1, bc2 = 1 - self.b1 ** self.t, 1 - self.b2 ** self.t
-        lat_e.addcdiv_(mf, vf.div_(bc2).sqrt_().add_(self.eps), value=-self.lr / bc1)
+        if lat_e.dtype == torch.float32:
+            lat_e.addcdiv_(mf, vf.div_(bc2).sqrt_().add_(self.eps), value=-self.lr / bc1)
+        else:                                  # low-precision latent: update in fp32, round stochastically
+            lat_e.copy_(stochastic_round(lat_e.float().addcdiv_(mf, vf.div_(bc2).sqrt_().add_(self.eps),
+                                                                  value=-self.lr / bc1), lat_e.dtype))
 
 
 class TernaryMoE(torch.autograd.Function):
@@ -218,7 +233,7 @@ class TernaryMoE(torch.autograd.Function):
 class TernaryExperts(nn.Module):
     """Drop-in for Qwen4ExpTextExperts: folded ternary experts with learnable scales."""
 
-    def __init__(self, gate_up: torch.Tensor, down: torch.Tensor, device):
+    def __init__(self, gate_up: torch.Tensor, down: torch.Tensor, device, latent_dtype=torch.float32):
         super().__init__()
         E, twoI, H = gate_up.shape
         self.I = twoI // 2
@@ -228,7 +243,8 @@ class TernaryExperts(nn.Module):
             for e0 in range(0, E, 32):                       # fold + scale init in chunks
                 gf = self.rot_h.fold(gate_up[e0:e0 + 32].to(device))
                 df = self.rot_i.fold(down[e0:e0 + 32].to(device))
-                gl.append(gf); gs.append(mseopt_scale(gf)); dl.append(df); ds.append(mseopt_scale(df))
+                gs.append(mseopt_scale(gf)); ds.append(mseopt_scale(df))
+                gl.append(gf.to(latent_dtype)); dl.append(df.to(latent_dtype)); del gf, df
         self.gu_lat = nn.Parameter(torch.cat(gl)); self.gu_s = nn.Parameter(torch.cat(gs))
         self.dn_lat = nn.Parameter(torch.cat(dl)); self.dn_s = nn.Parameter(torch.cat(ds))
         self.opt = None                                          # set to FusedAdam to train
@@ -372,6 +388,9 @@ def main():
     ap.add_argument("--max-vram", type=float, default=0,
                     help="cap this process's CUDA memory (GiB); the caching allocator then releases cached "
                          "blocks instead of growing past it. 0 = no cap")
+    ap.add_argument("--latent-dtype", default="fp32", choices=list(LATENT_DTYPES),
+                    help="storage of the expert latents; fp16/bf16 halve their VRAM and are updated with "
+                         "stochastic rounding")
     ap.add_argument("--adam-bits", type=int, default=16, choices=[8, 16],
                     help="precision of the expert-latent Adam state (8 saves ~5 GB of VRAM)")
     ap.add_argument("--stream-dir", default="/data/eval/q4x_streams")
@@ -424,7 +443,8 @@ def main():
             del teacher; torch.cuda.empty_cache()
             student, _, _, _ = build_layer(L, {k: v for k, v in W.items() if not k.startswith("mlp.experts.")}, device=dev,
                                           drop_experts=True)
-            student.mlp.experts = TernaryExperts(W["mlp.experts.gate_up_proj"], W["mlp.experts.down_proj"], dev)
+            student.mlp.experts = TernaryExperts(W["mlp.experts.gate_up_proj"], W["mlp.experts.down_proj"], dev,
+                                                 latent_dtype=LATENT_DTYPES[a.latent_dtype])
             del W
             student.mlp.experts.load_values(done)
             S_tr, S_va = run(student, runner, S_tr), run(student, runner, S_va)
@@ -441,7 +461,8 @@ def main():
 
         student, _, _, _ = build_layer(L, {k: v for k, v in W.items() if not k.startswith("mlp.experts.")}, device=dev,
                                           drop_experts=True)
-        student.mlp.experts = TernaryExperts(W["mlp.experts.gate_up_proj"], W["mlp.experts.down_proj"], dev)
+        student.mlp.experts = TernaryExperts(W["mlp.experts.gate_up_proj"], W["mlp.experts.down_proj"], dev,
+                                                 latent_dtype=LATENT_DTYPES[a.latent_dtype])
         del W
         for p in student.parameters():
             p.requires_grad_(False)
