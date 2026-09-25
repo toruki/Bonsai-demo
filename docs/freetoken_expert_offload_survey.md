@@ -350,3 +350,18 @@ FreeToken の cache は qwen4exp に概念上適用でき、現 FreeToken は of
 5. 必要なら hybrid CPU と QSA indexer memory 削減
 
 静的 `-ot` は各段階の baseline/fallback として残す。この順なら、最初の小さな trace 実験で cache の成立性を判断でき、成立しない場合も PTQ1 kernel や model graph を壊す前に止められる。
+
+
+## 付録 A. 実測 VRAM 予算(2026-09-26、fork build-q4x、IQ3_XXS、routed expert を全て CPU、`-fa on`)
+
+`llama-cli -lv 4 -ngl 99 -cmoe` のロードログから。CUDA context のアイドル分(約 0.8 GB)は別。
+
+| context | model(非 expert) | QSA KV | GDN RS | indexer KV | compute | 合計 | 32 GB − 合計 − 3.5 GiB 余裕 = cache | IQ3 slot 数(1.88 MiB)/ 常駐率(48 層) |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 32k | 3,816 | 768 | 113 | 288 | 1,056 | 6,041 MiB | 約 22.1 GiB | 約 11,800 / 48 % |
+| 128k | 3,816 | 3,072 | 113 | 1,152 | 1,201 | 9,354 MiB | 約 18.8 GiB | 約 10,000 / 41 % |
+| 256k | 3,816 | 6,144 | 113 | 2,304 | 1,969 | 14,346 MiB | 約 13.9 GiB | 約 7,400 / 30 % |
+
+routing trace(§ 20 of flash_next_progressive_pilot.md、コード corpus)の LRU 再生では常駐率 34 % で hit 91.8 %
+(miss 35/token ≈ 66 MiB/token)、51 % で 97.1 %(12.4/token ≈ 23 MiB/token)。256k は帯域次第で decode が
+数 ms/token 遅くなる見込み。indexer KV の K-only 化(§6.3、256k で約 2 GiB)は cache 側にそのまま効く。
