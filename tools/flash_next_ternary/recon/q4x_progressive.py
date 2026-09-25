@@ -34,6 +34,7 @@ sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
 from bonsai_format import hadamard_matrix  # noqa: E402
 from gguf_inject_ternary import make_signs  # noqa: E402
 from ternary_store import load_experts, save_experts  # noqa: E402
+from latent_ckpt import save_latents  # noqa: E402
 from q4x_layer import FLASH_GGUF, GGUFTensors, LayerRunner, build_layer, layer_weights, text_config  # noqa: E402
 
 BLOCK = 128
@@ -393,6 +394,9 @@ def main():
                          "stochastic rounding")
     ap.add_argument("--adam-bits", type=int, default=16, choices=[8, 16],
                     help="precision of the expert-latent Adam state (8 saves ~5 GB of VRAM)")
+    ap.add_argument("--save-latents", default=None,
+                    help="also write latents_L{N}.npz (latents + scales, see latent_ckpt.py) to this directory, "
+                         "so a later run can warm-start from the real training state")
     ap.add_argument("--stream-dir", default="/data/eval/q4x_streams")
     ap.add_argument("--save-streams-at", type=int, nargs="*", default=[],
                     help="save the student/canonical streams entering these layers to --stream-dir")
@@ -590,6 +594,9 @@ def main():
         # advance streams
         S_tr = run(student, runner, S_tr); S_va = e1["Y"]
         C_tr, C_va = Cx_tr, Cx_va
+        if a.save_latents:
+            Path(a.save_latents).mkdir(parents=True, exist_ok=True)
+            save_latents(Path(a.save_latents) / f"latents_L{L}.npz", ex)
         exp = ex.export()
         save_experts(out / f"experts_L{L}.npz", {k: exp[k].astype(np.float16) for k in ("gate", "up", "down")})
         ll["exit_stream_vsC"] = rel(S_va, C_va)

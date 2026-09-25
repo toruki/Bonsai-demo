@@ -29,6 +29,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from latent_ckpt import load_latents
 from q4x_progressive import (FLASH_GGUF, LATENT_DTYPES, FusedAdam, GGUFTensors, LayerRunner, TernaryExperts,
                              build_layer, layer_weights, load_stream, rel, run, save_experts, text_config)
 
@@ -59,6 +60,8 @@ def main():
     ap.add_argument("--valid-dir", default="/data/eval/q4x_act_valid")
     ap.add_argument("--out", required=True)
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--init-latents", default=None,
+                    help="warm start from latents_L{N}.npz (real latents + scales) in this directory")
     ap.add_argument("--init-from", default=None,
                     help="warm start: initialise both layers of each block from experts_L{N}.npz in this directory "
                          "(e.g. the one-layer progressive result) instead of PTQ")
@@ -112,7 +115,10 @@ def main():
         print(f"\n=== block {L}-{L + 1} ({cfg.layer_types[L]}, {cfg.layer_types[L + 1]}) teachers {time.time()-t0:.0f}s", flush=True)
 
         st0 = build_student(W0, L, dev, ldt); st1 = build_student(W1, L + 1, dev, ldt); del W0, W1
-        if a.init_from:
+        if a.init_latents:
+            load_latents(Path(a.init_latents) / f"latents_L{L}.npz", st0.mlp.experts)
+            load_latents(Path(a.init_latents) / f"latents_L{L + 1}.npz", st1.mlp.experts)
+        elif a.init_from:
             st0.mlp.experts.load_values(Path(a.init_from) / f"experts_L{L}.npz")
             st1.mlp.experts.load_values(Path(a.init_from) / f"experts_L{L + 1}.npz")
         ex0, ex1 = st0.mlp.experts, st1.mlp.experts
@@ -135,7 +141,7 @@ def main():
                     f"stream vsC L{L} {e['exit1_vsC']:.4f} L{L + 1} {e['exit2_vsC']:.4f}")
 
         e0 = evaluate(); ll = {"ptq": {k: v for k, v in e0.items() if not k.startswith("Y")}}
-        print(f"  {'warm init' if a.init_from else 'PTQ init '}: {fmt(e0)}", flush=True)
+        print(f"  {'warm init' if (a.init_from or a.init_latents) else 'PTQ init '}: {fmt(e0)}", flush=True)
         del e0
 
         for ex in (ex0, ex1):
