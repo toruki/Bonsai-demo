@@ -2,6 +2,10 @@
 # Evaluate a Flash-Next variant whose routed experts in some layers were replaced by
 # trained/PTQ ternary values (experts_L{N}.npz from q4x_progressive.py).
 #   eval_q4x_variant.sh <name> <values-dir> <first> <last>      (name=base: IQ3_XXS reference only)
+# Env: LAYER_LIST="4 5 ... 47"  replaces seq <first> <last> (e.g. to leave some layers at IQ3_XXS);
+#      MODEL_ROOT=DIR            where model_<name>/ is written (default: EVAL_DIR);
+#      a shard file (or symlink to an identical one) already present in model_<name>/ is kept
+#      unless REINJECT=1, so shards shared with another variant can be linked in beforehand.
 # Writes PPL + KL (32 x 512 wikitext-2 test, vs the IQ3_XXS logits) and routing / MoE dumps
 # (8 x 512 tokens, into $RMASS_DIR/rmass_<name>, compared with rmass_base by routing_mass.py).
 set -uo pipefail
@@ -22,18 +26,17 @@ if [ "$NAME" = base ]; then
   $B/llama-perplexity -m $M -f $TXT -c 512 -b 512 --chunks 32 -ngl 12 --kl-divergence-base $KLB > $EV/ppl_base.log 2>&1
   grep "Final estimate" $EV/ppl_base.log
 else
-  D=$EV/model_$NAME; mkdir -p $D
-  LAYERS=$(seq $FIRST $LAST)
+  D=${MODEL_ROOT:-$EV}/model_$NAME; mkdir -p $D
+  LAYERS=${LAYER_LIST:-$(seq $FIRST $LAST)}
   N=""; for l in $LAYERS; do N="$N blk.$l.ffn_down_exps.weight blk.$l.ffn_gate_exps.weight blk.$l.ffn_up_exps.weight"; done
-  if [ -f $D/$S-00001-of-00003.gguf ] && [ -f $D/$S-00002-of-00003.gguf ] && [ -z "${REINJECT:-}" ]; then
-    step "$NAME: model already built, skipping injection (REINJECT=1 to redo)"
-  else
   # routed experts of blk 0-17 live in shard 2, blk 18-47 in shard 3 (UD-IQ3_XXS split)
   L2=""; L3=""; for l in $LAYERS; do if [ $l -le 17 ]; then L2="$L2 $l"; else L3="$L3 $l"; fi; done
   : > $EV/inject_$NAME.log
   for sh in 2 3; do
     SL=$([ $sh = 2 ] && echo "$L2" || echo "$L3")
-    if [ -n "$SL" ]; then
+    if [ -e $D/$S-0000$sh-of-00003.gguf ] && [ -z "${REINJECT:-}" ]; then
+      step "$NAME: shard $sh present, kept ($(readlink -f $D/$S-0000$sh-of-00003.gguf))"
+    elif [ -n "$SL" ]; then
       step "$NAME: inject shard $sh (layers$SL)"
       $PY -u $HERE/../gguf_inject_ternary.py --src $SRC/$S-0000$sh-of-00003.gguf --dst $D/$S-0000$sh-of-00003.gguf \
           --layers $SL --values-dir $VAL >> $EV/inject_$NAME.log 2>&1 || { step "inject FAILED"; tail -5 $EV/inject_$NAME.log; exit 1; }
@@ -41,8 +44,11 @@ else
       ln -sf $SRC/$S-0000$sh-of-00003.gguf $D/$S-0000$sh-of-00003.gguf
     fi
   done
-  $PY -u $HERE/../gguf_inject_ternary.py --src $SRC/$S-00001-of-00003.gguf --dst $D/$S-00001-of-00003.gguf \
-      --kv-only --names $N --widths 640 2560 >> $EV/inject_$NAME.log 2>&1 || { step "kv FAILED"; exit 1; }
+  if [ -e $D/$S-00001-of-00003.gguf ] && [ -z "${REINJECT:-}" ]; then
+    step "$NAME: shard 1 present, kept"
+  else
+    $PY -u $HERE/../gguf_inject_ternary.py --src $SRC/$S-00001-of-00003.gguf --dst $D/$S-00001-of-00003.gguf \
+        --kv-only --names $N --widths 640 2560 >> $EV/inject_$NAME.log 2>&1 || { step "kv FAILED"; exit 1; }
   fi
   M=$D/$S-00001-of-00003.gguf
   step "$NAME: PPL + KL"
