@@ -386,6 +386,26 @@ scale はグリッド探索の weight-MSE 最適、STE の範囲を −1.5 ≤ u
 stream 誤差は 22 % 減ったが KL は 8.5 % 減に留まり、事前に固定した継続基準(−20 %)に届かない。
 2 bit の 44 層化(+4.8 GiB、約 10 時間)は見送り、量子化の探索はここで止める。
 
+## 20. routing trace と expert cache の hit 率(`recon/lru_replay.py`)
+
+コード corpus(llama.cpp のソース 10.5 MB、64 × 512 token = 32k token)で各層の top-10 expert を記録し、
+FreeToken 型の global (layer, expert) LRU を offline で再生(layer 4–46、先頭 2048 token は warmup)。
+
+- routing は強く偏る: 各層で picks の 50 % を約 31 expert、90 % を 150–180 expert(512 中)が占める。
+- 一様 routing の試算(常駐率 66 % で hit 66 %、153 MiB/token)より桁違いに良い。
+
+| slot 数(常駐率) | IQ3_XXS: hit / miss/token | ternary 44: hit / miss/token |
+|---|---:|---:|
+| 19,456(88 %) | 99.9 % / 0.4 | 99.9 % / 0.3 |
+| 14,848(67 %) | 99.1 % / 4.0 | 99.4 % / 2.8 |
+| 11,264(51 %) | 97.1 % / 12.4 | 97.8 % / 9.4 |
+| 7,424(34 %) | 91.8 % / 35.3 | 93.3 % / 29.0 |
+
+1 slot は IQ3_XXS で 1.88 MiB、ternary で 1.025 MiB。IQ3_XXS を 11,264 slot(約 21 GB)常駐させても
+miss は 12.4/token ≈ 23 MiB/token で、PCIe の帯域なら 1–2 ms/token に収まる見込み(実測は未)。
+→ 品質劣化のない IQ3_XXS + expert cache が現実的な候補になる。注意: 単一 corpus の 32k token で、
+実セッション(多様なファイル、decode 時の routing)ではもっと散る可能性がある。
+
 ## 再現
 
 ```bash

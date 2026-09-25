@@ -19,7 +19,7 @@
 | 9 | [head_calibration.md](head_calibration.md) | stream × head のクロス評価と較正 | 出荷の優位は stream と head の共適応。後付け較正では埋まらない |
 | 10 | [suffix_pilot.md](suffix_pilot.md) | suffix-aware(最終 logits への KL)progressive | baseline より悪化。logits 目的関数はデータ律速 |
 | 11 | [qwen4exp_port.md](qwen4exp_port.md) | Flash-Next runtime の移植と ternary expert | **移植完了・全 48 層 ternary が 5090 に載る(28.9 GiB)**。品質は未達 |
-| 12 | [flash_next_progressive_pilot.md](flash_next_progressive_pilot.md) | Flash-Next の progressive reconstruction(8 → 16 → 44 層) | **layer 4–47 で PPL 3.17 / KL 0.49**(全層 PTQ は 22.3)。5090 で 28.6 GB・76 t/s |
+| 12 | [flash_next_progressive_pilot.md](flash_next_progressive_pilot.md) | Flash-Next の progressive reconstruction(8 → 16 → 44 層)と改善の探索 | 44 層 ternary PPL 3.17 / KL 0.49。2 層 block・追加学習対象・anchor・2 bit 化はいずれも小改善で探索終了。routing は強く偏り expert cache が有効 |
 | 13 | [freetoken_expert_offload_survey.md](freetoken_expert_offload_survey.md) | FreeToken の expert cache を ternary Flash-Next に使えるか(Codex 調査) | FreeToken の LRU expert cache を PrismML fork へ移植する案を推奨。まず routing trace で hit 率を検証 |
 
 ## 到達点
