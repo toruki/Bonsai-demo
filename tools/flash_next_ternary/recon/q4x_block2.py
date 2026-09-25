@@ -59,6 +59,9 @@ def main():
     ap.add_argument("--valid-dir", default="/data/eval/q4x_act_valid")
     ap.add_argument("--out", required=True)
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--init-from", default=None,
+                    help="warm start: initialise both layers of each block from experts_L{N}.npz in this directory "
+                         "(e.g. the one-layer progressive result) instead of PTQ")
     ap.add_argument("--adam-bits", type=int, default=8, choices=[8, 16])
     ap.add_argument("--latent-dtype", default="fp16", choices=list(LATENT_DTYPES))
     ap.add_argument("--max-vram", type=float, default=24)
@@ -109,6 +112,9 @@ def main():
         print(f"\n=== block {L}-{L + 1} ({cfg.layer_types[L]}, {cfg.layer_types[L + 1]}) teachers {time.time()-t0:.0f}s", flush=True)
 
         st0 = build_student(W0, L, dev, ldt); st1 = build_student(W1, L + 1, dev, ldt); del W0, W1
+        if a.init_from:
+            st0.mlp.experts.load_values(Path(a.init_from) / f"experts_L{L}.npz")
+            st1.mlp.experts.load_values(Path(a.init_from) / f"experts_L{L + 1}.npz")
         ex0, ex1 = st0.mlp.experts, st1.mlp.experts
         scl = [ex0.gu_s, ex0.dn_s, ex1.gu_s, ex1.dn_s]
         for p in [ex0.gu_lat, ex0.dn_lat, ex1.gu_lat, ex1.dn_lat] + scl:
@@ -129,7 +135,7 @@ def main():
                     f"stream vsC L{L} {e['exit1_vsC']:.4f} L{L + 1} {e['exit2_vsC']:.4f}")
 
         e0 = evaluate(); ll = {"ptq": {k: v for k, v in e0.items() if not k.startswith("Y")}}
-        print(f"  PTQ init : {fmt(e0)}", flush=True)
+        print(f"  {'warm init' if a.init_from else 'PTQ init '}: {fmt(e0)}", flush=True)
         del e0
 
         for ex in (ex0, ex1):

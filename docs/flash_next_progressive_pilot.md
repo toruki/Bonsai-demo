@@ -261,6 +261,28 @@ VRAM と速度は layer 0–3 の expert を CPU に置いた構成(`-ot`)で測
 少数の難しい層が後段を壊しているのではなく、層をまたいだ累積が主因。
 → 数層だけの mixed precision は費用対効果が合わない。
 
+## 14. 2 層 block reconstruction(block 4–5 での診断)
+
+`recon/q4x_block2.py`:layer L と L+1 を同時に学習し、2 層通過後の出力を主 loss にする
+(+ 0.1 × layer L 出口、+ 0.2 × canonical anchor、router 項なし)。VRAM を 24 GB に収めるため
+expert latent は fp16(確率的丸めで更新、layer 4 の 1 層学習で 0.1126 vs fp32 0.1125 と同等)。
+
+| block 4–5(layer 5 出口 stream relMSE、1 層版 0.0193) | 結果 |
+|---|---:|
+| PTQ | 0.0332 |
+| 2 層同時、PTQ から、lr 1e-4 | 0.0277(不安定) |
+| 2 層同時、PTQ から、lr 5e-5 | 0.0224(300 step でまだ低下中) |
+| 1 層版から warm start、scale 固定 | 0.0193(値が一切変わらない) |
+| 1 層版から warm start、scale lr 1e-5 | 0.0204 |
+| 1 層版から warm start、scale lr 1e-4 | 0.0384 |
+
+- 2 層同時学習は、この block では 1 層版に勝てない。1 層版の目標 A = teacher(学生入力) が
+  すでに上流誤差を織り込んでおり、2 層化で得るのは「L が L+1 を見越せる」分だけ。
+  その代わり勾配が 2 層分の STE を通ってノイズが増える。
+- npz は code × scale しか持たないので、warm start の latent は code の中心から始まり、
+  300 step では境界(0.5 scale)まで動けない。変化は scale の Adam 更新(ノイズ主導)だけで、悪化する。
+- 副産物:scale の学習率(1e-4)は、1 層版でもノイズ源になっている可能性がある。
+
 ## 再現
 
 ```bash
