@@ -300,6 +300,20 @@ PTQ から始める限り scale は mse-opt 初期値でほぼ最適で、学習
 以後は scale lr 3e-6 を使う(効果はほぼない)。latent を保存する `recon/latent_ckpt.py` と
 `--save-latents` / `--init-latents` を追加した。
 
+## 16. latent からの warm start で 2 層 block 微調整(block 4–5)
+
+1 層 progressive(scale lr 3e-6、fp16 latent)で layer 4–5 を学習して latent を保存し、
+そこから 2 層 block 目的で微調整(scale 固定)。warm init は 1 層版と完全一致(layer 5 出口 0.0192)。
+
+| layer 5 出口 stream relMSE | init | 100 | 200 | 300 |
+|---|---:|---:|---:|---:|
+| lr_w 3e-5 | 0.0192 | 0.0220 | 0.0204 | 0.0200 |
+| lr_w 1e-5 | 0.0192 | 0.0195 | 0.0189 | **0.0187** |
+
+block delta は 0.1034 → 0.1005(−2.8 %)。2 層目的で初めて 1 層版を下回ったが、改善は数 % で、
+8 層 KL 0.115 → 0.08–0.09 という目安には遠い。「layer L が L+1 を見越す」効果は小さく、
+層をまたいだ誤差増幅は 2 層の範囲の再構成では抑えきれない。
+
 ## 再現
 
 ```bash
