@@ -212,3 +212,31 @@ scheduler の評価 callback は対象 node まで実行して backend を同期
 根拠：[ggml-backend.cpp:1748](/home/sohey/AI/LLM/Bonsai-demo/llama.cpp/ggml/src/ggml-backend.cpp:1748)。
 
 同日に replay を全 48 層・8,000 slot・実 byte 数へ合わせ、cold 区間と定常区間を分けます。実装予定の「選択中 slot を保護する」LRU も参照モデル化します。初日の成果物は、**正しい容量分母、host 制御の ms/token、実際の miss bytes/token** の三つです。これで M1 の検証基準が定まり、host 版で運用評価まで進めるか、早めに M3 が必要かを判断できます。
+
+## M0 の実測(2026-09-26)
+
+### routing trace(IQ3_XXS、全 48 層、コード corpus 32k token、選択中 expert を保護する LRU)
+layer 0 は他より散る(picks の 50 % / 90 % を 82 / 282 expert)。中間層は 31 / 204。
+
+| slot 数 | 常駐率 | hit | miss/token | MiB/token(1.879 MiB/slot) |
+|---:|---:|---:|---:|---:|
+| 14,848 | 60 % | 98.4 % | 7.9 | 14.8 |
+| 11,800 | 48 % | 96.3 % | 17.7 | 33.2 |
+| 10,600 | 43 % | 95.1 % | 23.6 | 44.3 |
+| 8,175(256k 予算) | 33 % | 91.1 % | 42.8 | 80.5 |
+
+### host 往復の費用(ternary-44 を GPU 常駐、1 token ずつ 128 token、`dump_hidden --decode-timing`)
+
+| 条件 | CUDA graph あり | CUDA graph なし |
+|---|---:|---:|
+| A: callback なし | 7.53 ms/tok(133 t/s) | 15.82 |
+| B: 48 層の top-k で graph を止める(読まない) | 20.06 ms/tok(50 t/s) | 29.44 |
+| C: B + top-10 id を host に読む | 19.85 | — |
+| D: C + 8,175 slot の LRU(転送なし) | 19.79 | — |
+
+- 層ごとの graph 分割・同期そのものが **約 12.5–13.6 ms/token**(48 分割で 1 分割 ≈ 0.27 ms)。
+  id の読み出しと LRU の計算は誤差の範囲。CUDA graph の有無によらず同じ増分なので、graph の再生を失う
+  費用ではなく分割・同期の費用。
+- 256k 予算(8,175 slot)で miss 80 MiB/token を PCIe で転送すると +3–5 ms/token の見込み。
+- したがって host 制御の M1 は約 24 ms/token(約 40 t/s)が上限の目安で、133 t/s 級に戻すには
+  M3(device 側 lookup/copy、同期なし)が必須。M1 は正しさと 256k 動作の確認に位置付ける。
