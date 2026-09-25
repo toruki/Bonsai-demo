@@ -17,7 +17,7 @@ import numpy as np
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("trace")
-    ap.add_argument("--layers", type=int, nargs=2, default=[4, 47], help="first and last cached layer")
+    ap.add_argument("--layers", type=int, nargs=2, default=[0, 47], help="first and last cached layer")
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--slots", type=int, nargs="+", default=[22528, 19456, 14848, 11264, 7424])
     ap.add_argument("--bytes-per-expert", type=float, default=1.025, help="MiB per (layer, expert) slot")
@@ -40,15 +40,19 @@ def main():
         cache = OrderedDict(); hits = misses = 0
         for t in range(T):
             for l in range(L):
+                # protect every resident expert of this token's top-k before evicting for the misses
+                miss = []
                 for e in routes[t, l]:
                     key = l * 1024 + int(e)
                     if key in cache:
                         cache.move_to_end(key)
                         if t >= a.warmup: hits += 1
                     else:
+                        miss.append(key)
                         if t >= a.warmup: misses += 1
-                        cache[key] = None
-                        if len(cache) > s: cache.popitem(last=False)
+                for key in miss:
+                    cache[key] = None
+                    if len(cache) > s: cache.popitem(last=False)
         n = max(T - a.warmup, 1)
         print(f"{s:8d} {s / total:6.2f} {hits / (hits + misses):7.3f} {misses / n:9.1f} {misses / n * a.bytes_per_expert:8.1f}")
 
