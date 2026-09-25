@@ -189,7 +189,7 @@ class TernaryMoE(torch.autograd.Function):
     instead of saved, and parameter grads are materialised once (not per expert)."""
 
     @staticmethod
-    def forward(ctx, x_rot, idx, wts, gu_lat, gu_s, dn_lat, dn_s, rot_i, I, opt, dn_hi=1):
+    def forward(ctx, x_rot, idx, wts, gu_lat, gu_s, dn_lat, dn_s, rot_i, I, opt, dn_hi=1, gu_hi=1):
         T = x_rot.shape[0]
         out = torch.zeros(T, dn_lat.shape[1], device=x_rot.device, dtype=x_rot.dtype)
         E = gu_lat.shape[0]
@@ -198,19 +198,19 @@ class TernaryMoE(torch.autograd.Function):
         for e in hit:
             pos, ti = torch.where(mask[e])
             xe = x_rot[ti]
-            gu = xe @ quant(gu_lat[e], gu_s[e])[0].t()
+            gu = xe @ quant(gu_lat[e], gu_s[e], gu_hi)[0].t()
             g, u = gu[:, :I], gu[:, I:]
             h = F.silu(g) * u
             ye = rot_i.fwd(h) @ quant(dn_lat[e], dn_s[e], dn_hi)[0].t()
             out.index_add_(0, ti, ye * wts[ti, pos, None])
         ctx.save_for_backward(x_rot, idx, wts, gu_lat, gu_s, dn_lat, dn_s)
-        ctx.rot_i, ctx.I, ctx.hit, ctx.mask, ctx.opt, ctx.dn_hi = rot_i, I, hit, mask, opt, dn_hi
+        ctx.rot_i, ctx.I, ctx.hit, ctx.mask, ctx.opt, ctx.dn_hi, ctx.gu_hi = rot_i, I, hit, mask, opt, dn_hi, gu_hi
         return out
 
     @staticmethod
     def backward(ctx, gout):
         x_rot, idx, wts, gu_lat, gu_s, dn_lat, dn_s = ctx.saved_tensors
-        rot_i, I, dn_hi = ctx.rot_i, ctx.I, ctx.dn_hi
+        rot_i, I, dn_hi, gu_hi = ctx.rot_i, ctx.I, ctx.dn_hi, ctx.gu_hi
         gx = torch.zeros_like(x_rot)
         gw = torch.zeros_like(wts)
         opt = ctx.opt
@@ -220,7 +220,7 @@ class TernaryMoE(torch.autograd.Function):
         for e in ctx.hit:
             pos, ti = torch.where(ctx.mask[e])
             xe = x_rot[ti]
-            Wgu = quant(gu_lat[e], gu_s[e])[0]
+            Wgu = quant(gu_lat[e], gu_s[e], gu_hi)[0]
             Wdn = quant(dn_lat[e], dn_s[e], dn_hi)[0]
             gu = xe @ Wgu.t()
             g, u = gu[:, :I], gu[:, I:]
@@ -242,28 +242,29 @@ class TernaryMoE(torch.autograd.Function):
             gu_ = gh * sg
             ggu = torch.cat([gg, gu_], dim=1)
             gWgu = ggu.t() @ xe
-            a, b = ste_grads(gWgu, gu_lat[e], gu_s[e]); g_gus[e] += b
+            a, b = ste_grads(gWgu, gu_lat[e], gu_s[e], gu_hi); g_gus[e] += b
             gx.index_add_(0, ti, ggu @ Wgu)               # uses Wgu before the latent moves
             if opt is None: g_gul[e] += a
             else: opt.update("gu", gu_lat[e], e, a)
-        return gx, None, gw, g_gul, g_gus, g_dnl, g_dns, None, None, None, None
+        return gx, None, gw, g_gul, g_gus, g_dnl, g_dns, None, None, None, None, None
 
 
 class TernaryExperts(nn.Module):
     """Drop-in for Qwen4ExpTextExperts: folded ternary experts with learnable scales."""
 
-    def __init__(self, gate_up: torch.Tensor, down: torch.Tensor, device, latent_dtype=torch.float32, dn_hi=1):
+    def __init__(self, gate_up: torch.Tensor, down: torch.Tensor, device, latent_dtype=torch.float32, dn_hi=1, gu_hi=1):
         super().__init__()
         E, twoI, H = gate_up.shape
-        self.I, self.dn_hi = twoI // 2, dn_hi
+        self.I, self.dn_hi, self.gu_hi = twoI // 2, dn_hi, gu_hi
         dn_scale = mseopt_scale if dn_hi == 1 else mseopt_scale4
+        gu_scale = mseopt_scale if gu_hi == 1 else mseopt_scale4
         self.rot_h, self.rot_i = Rot(H, device), Rot(self.I, device)
         gl, gs, dl, ds = [], [], [], []
         with torch.no_grad():
             for e0 in range(0, E, 32):                       # fold + scale init in chunks
                 gf = self.rot_h.fold(gate_up[e0:e0 + 32].to(device))
                 df = self.rot_i.fold(down[e0:e0 + 32].to(device))
-                gs.append(mseopt_scale(gf)); ds.append(dn_scale(df))
+                gs.append(gu_scale(gf)); ds.append(dn_scale(df))
                 gl.append(gf.to(latent_dtype)); dl.append(df.to(latent_dtype)); del gf, df
         self.gu_lat = nn.Parameter(torch.cat(gl)); self.gu_s = nn.Parameter(torch.cat(gs))
         self.dn_lat = nn.Parameter(torch.cat(dl)); self.dn_s = nn.Parameter(torch.cat(ds))
@@ -272,7 +273,7 @@ class TernaryExperts(nn.Module):
     def forward(self, hidden_states, top_k_index, top_k_weights):
         x_rot = self.rot_h.fwd(hidden_states)
         return TernaryMoE.apply(x_rot, top_k_index, top_k_weights, self.gu_lat, self.gu_s,
-                                self.dn_lat, self.dn_s, self.rot_i, self.I, self.opt, self.dn_hi)
+                                self.dn_lat, self.dn_s, self.rot_i, self.I, self.opt, self.dn_hi, self.gu_hi)
 
     @torch.no_grad()
     def load_values(self, src):
@@ -303,7 +304,7 @@ class TernaryExperts(nn.Module):
         out = {"gate": [], "up": [], "down": []}; codes = {"gate": [], "up": [], "down": []}; zeros = 0; total = 0
         for e0 in range(0, E, chunk):
             gs, ds = self.gu_s[e0:e0 + chunk].half().float(), self.dn_s[e0:e0 + chunk].half().float()
-            gu, gt, _ = quant(self.gu_lat[e0:e0 + chunk], gs)
+            gu, gt, _ = quant(self.gu_lat[e0:e0 + chunk], gs, self.gu_hi)
             dn, dt, _ = quant(self.dn_lat[e0:e0 + chunk], ds, self.dn_hi)
             out["gate"].append(gu[:, :I].half().cpu().numpy()); out["up"].append(gu[:, I:].half().cpu().numpy())
             out["down"].append(dn.half().cpu().numpy())
@@ -314,7 +315,8 @@ class TernaryExperts(nn.Module):
             del gu, gt, dn, dt
         res = {k: np.concatenate(v) for k, v in out.items()}
         res["codes"] = {k: np.concatenate(v) for k, v in codes.items()}
-        res["scales"] = {"gate": self.gu_s[:, :I // GROUP].half().cpu().numpy(), "up": self.gu_s[:, I // GROUP:].half().cpu().numpy(),
+        # gu_s is [E, 2I, H/GROUP]: one scale per output row per input group; gate = first I rows
+        res["scales"] = {"gate": self.gu_s[:, :I].half().cpu().numpy(), "up": self.gu_s[:, I:].half().cpu().numpy(),
                          "down": self.dn_s.half().cpu().numpy()}
         res["zero_frac"] = zeros / total
         return res
@@ -425,6 +427,8 @@ def main():
     ap.add_argument("--max-vram", type=float, default=0,
                     help="cap this process's CUDA memory (GiB); the caching allocator then releases cached "
                          "blocks instead of growing past it. 0 = no cap")
+    ap.add_argument("--gate-up-levels", type=int, default=3, choices=[3, 4],
+                    help="4: gate/up use the PQ2_0 levels {-1,0,1,2} (2 bit) instead of ternary")
     ap.add_argument("--down-levels", type=int, default=3, choices=[3, 4],
                     help="4: the down projection uses the PQ2_0 levels {-1,0,1,2} (2 bit) instead of ternary")
     ap.add_argument("--latent-dtype", default="fp32", choices=list(LATENT_DTYPES),
@@ -486,7 +490,8 @@ def main():
             student, _, _, _ = build_layer(L, {k: v for k, v in W.items() if not k.startswith("mlp.experts.")}, device=dev,
                                           drop_experts=True)
             student.mlp.experts = TernaryExperts(W["mlp.experts.gate_up_proj"], W["mlp.experts.down_proj"], dev,
-                                                 latent_dtype=LATENT_DTYPES[a.latent_dtype], dn_hi=a.down_levels - 2)
+                                                 latent_dtype=LATENT_DTYPES[a.latent_dtype], dn_hi=a.down_levels - 2,
+                                                 gu_hi=a.gate_up_levels - 2)
             del W
             student.mlp.experts.load_values(done)
             S_tr, S_va = run(student, runner, S_tr), run(student, runner, S_va)
@@ -504,7 +509,8 @@ def main():
         student, _, _, _ = build_layer(L, {k: v for k, v in W.items() if not k.startswith("mlp.experts.")}, device=dev,
                                           drop_experts=True)
         student.mlp.experts = TernaryExperts(W["mlp.experts.gate_up_proj"], W["mlp.experts.down_proj"], dev,
-                                                 latent_dtype=LATENT_DTYPES[a.latent_dtype], dn_hi=a.down_levels - 2)
+                                                 latent_dtype=LATENT_DTYPES[a.latent_dtype], dn_hi=a.down_levels - 2,
+                                                 gu_hi=a.gate_up_levels - 2)
         del W
         for p in student.parameters():
             p.requires_grad_(False)
