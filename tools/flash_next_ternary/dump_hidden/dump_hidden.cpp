@@ -130,6 +130,8 @@ int main(int argc, char ** argv) {
     bool save_logits = true;
     bool all_rows = false;            // compute every token in the last layer (logits requested, not saved)
     int timing_tokens = 0;            // > 0: decode-timing mode (see timing_state)
+    int timing_skip = 8;              // decode tokens excluded from the statistics (cache warm-up)
+    bool dump_in_timing = false;      // also run the dump callback during decode-timing (single-token graphs)
     timing_state ts;
 
     // strip our own options before handing the rest to common_params_parse
@@ -145,6 +147,8 @@ int main(int argc, char ** argv) {
         if (!strcmp(argv[i], "--decode-timing") && i + 1 < argc) { timing_tokens = atoi(argv[++i]); continue; }
         if (!strcmp(argv[i], "--timing-mode") && i + 1 < argc) { ts.mode = atoi(argv[++i]); continue; }
         if (!strcmp(argv[i], "--timing-slots") && i + 1 < argc) { ts.slots = atoi(argv[++i]); continue; }
+        if (!strcmp(argv[i], "--timing-skip") && i + 1 < argc) { timing_skip = atoi(argv[++i]); continue; }
+        if (!strcmp(argv[i], "--dump-in-timing")) { dump_in_timing = true; continue; }
         args.push_back(argv[i]);
     }
     if (!common_params_parse((int) args.size(), args.data(), params, LLAMA_EXAMPLE_COMMON)) {
@@ -156,6 +160,7 @@ int main(int argc, char ** argv) {
 
     if (timing_tokens > 0) {
         if (ts.mode > 0) { params.cb_eval = cb_timing; params.cb_eval_user_data = &ts; }
+        if (dump_in_timing) { params.cb_eval = cb; params.cb_eval_user_data = &st; }
     } else {
         params.cb_eval = cb;
         params.cb_eval_user_data = &st;
@@ -188,6 +193,10 @@ int main(int argc, char ** argv) {
     for (auto & kv : st.shapes) { (void) kv; }
 
     const int n_vocab = llama_vocab_n_tokens(vocab);
+    if (timing_tokens > 0 && dump_in_timing) {
+        std::string mk2 = "mkdir -p '" + st.outdir + "'";
+        if (system(mk2.c_str()) != 0) { LOG_ERR("mkdir failed\n"); return 1; }
+    }
     if (timing_tokens > 0) {
         // prompt = first sequence in one batch, then greedy decode one token at a time
         const auto & sq = seqs.at(0);
@@ -206,7 +215,8 @@ int main(int argc, char ** argv) {
         const double prompt_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         LOG_INF("PREFILL %zu tokens in %.1f s (%.1f t/s)\n", sq.size(), prompt_s, sq.size() / prompt_s);
         llama_pos pos = (llama_pos) sq.size();
-        const int warm = 8;
+        const int warm = timing_skip;
+        double first_ms = 0; int n_first = 0;
         double total_ms = 0; std::vector<double> lat;
         llama_token tok = 0;
         for (int i = 0; i < timing_tokens; ++i) {
@@ -218,12 +228,13 @@ int main(int argc, char ** argv) {
             if (llama_decode(ctx, b1)) { LOG_ERR("decode failed\n"); return 1; }
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             llama_batch_free(b1);
-            if (i >= warm) { total_ms += ms; lat.push_back(ms); ts.tokens++; }
+            if (i >= warm) { total_ms += ms; lat.push_back(ms); ts.tokens++; } else { first_ms += ms; n_first++; }
         }
         std::sort(lat.begin(), lat.end());
         const double p50 = lat[lat.size() / 2], p95 = lat[(size_t) (lat.size() * 0.95)];
-        LOG_INF("TIMING mode=%d slots=%d tokens=%d  mean %.2f ms/tok (%.1f t/s)  p50 %.2f  p95 %.2f",
-                ts.mode, ts.slots, (int) lat.size(), total_ms / lat.size(), 1000.0 * lat.size() / total_ms, p50, p95);
+        LOG_INF("TIMING mode=%d slots=%d tokens=%d  mean %.2f ms/tok (%.1f t/s)  p50 %.2f  p95 %.2f  | first %d tokens: %.2f ms/tok",
+                ts.mode, ts.slots, (int) lat.size(), total_ms / lat.size(), 1000.0 * lat.size() / total_ms, p50, p95,
+                n_first, n_first ? first_ms / n_first : 0.0);
         if (ts.mode >= 3) {
             LOG_INF("  LRU: hit %.4f  miss/token %.2f", (double) ts.hits / (ts.hits + ts.misses),
                     (double) ts.misses / ts.tokens);
