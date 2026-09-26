@@ -550,6 +550,15 @@ save 0.5 s、restore 0.1 s。**末尾で生成した後の保存は、短い pre
 「prefix + 追加テキスト」は prompt_n=12 / 0.5 s で続き、prefix の直後を編集する要求も checkpoint 経由で 0.5 s。
 コードベースの長い prefix を一度作って使い回す運用に有効。
 
+### upstream への追従(2026-09-27)
+
+fork の `qwen4exp-port` を `origin/prism`(adfffbe41、upstream 8/25 時点 + PrismML 124 commit)へ rebase(30 commit、競合は
+E8 の `#define` と graph params の `.ecache` の 2 か所)。Bonsai-demo の `flash-next-ternary-analysis` も `origin/main` へ rebase
+(84 commit、README/AGENTS/environment_variables は先方の文面をベースに `BONSAI_KV` プリセットと `BONSAI_BIN_DIR` を戻し、
+`build_cuda_linux.sh` は先方版を採用)。旧 tip は `*-pre-rebase-20260927` tag。両 branch を toruki の fork に push。
+rebase 後ビルドの検証: 単 token PPL 2.4676 / batched 2.2672(旧ビルドと同一)、pooled / PLE / batched top-k の off/on とも KL 0、
+qsa_edit_test 69 step 一致、server(chat・tool_calls)動作。速度は Nsight で rebase 前後を比較(下記)。
+
 ### llama-server での prefix 再利用(単一 slot、65k context、expert cache 8,175 slot)
 
 | リクエスト | prefill された token | 時間 |
