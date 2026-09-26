@@ -535,6 +535,8 @@ CPU 3.3 s)。カーネル内訳: mul_mat_q 1.43 s、**DeviceTopK 1.25 s(497,664 
 per-row 版と同一(batched prefill の KL: mean 0、max は base の量子化下限)。**32k prefill 478 → 666 t/s(ub 1024、+39 %)**。
 128k(7,000 slot): ub 1024 471 → **591 t/s**、**ub 2048 862 t/s(2.5 分、VRAM peak 26.7 GB、compute buffer 4.1 GiB)**。
 起動スクリプトは `FLASH_UB` 既定を ≤128k で 2048、それ以上で 1024 に。
+256k(6,500 slot、ub 1024): 421 → **498 t/s(8.7 分)**。伸びが小さいのは context 比例の他の処理(1024 query × 全長 attention、
+indexer score の mul_mat など)が支配的なため(Nsight で内訳を取る)。
 
 **slot save/restore(llama-server `--slot-save-path`)**: 20k token の slot は 659 MiB(≈ 32 KiB/token → 220k で約 7 GB)、
 save 0.5 s、restore 0.1 s。**末尾で生成した後の保存は、短い prefix からの続きには使えない**(hybrid の状態は末尾時点のもの
