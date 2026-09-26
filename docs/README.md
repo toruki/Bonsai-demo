@@ -21,7 +21,7 @@
 | 11 | [qwen4exp_port.md](qwen4exp_port.md) | Flash-Next runtime の移植と ternary expert | **移植完了・全 48 層 ternary が 5090 に載る(28.9 GiB)**。品質は未達 |
 | 12 | [flash_next_progressive_pilot.md](flash_next_progressive_pilot.md) | Flash-Next の progressive reconstruction(8 → 16 → 44 層)と改善の探索 | 44 層 ternary PPL 3.17 / KL 0.49。2 層 block・追加学習対象・anchor・2 bit 化はいずれも小改善で探索終了。routing は強く偏り expert cache が有効 |
 | 13 | [freetoken_expert_offload_survey.md](freetoken_expert_offload_survey.md) | FreeToken の expert cache を ternary Flash-Next に使えるか(Codex 調査) | FreeToken の LRU expert cache を PrismML fork へ移植する案を推奨。まず routing trace で hit 率を検証 |
-| 14 | [expert_cache_plan.md](expert_cache_plan.md) | fork への expert cache 実装計画(Codex) | 固定 slot bank 3 本 + ID remap で既存 MMID を再利用。M0 観測 → M1 host LRU 最小版 |
+| 14 | [expert_cache_plan.md](expert_cache_plan.md) | fork の expert cache 計画(Codex)と M0–M3 の実装・計測、長文 decode の改善(PLE ring、pooled indexer K、決定的 top-k、flat get_rows、PLE host gather)、堅牢化(KV 編集テスト、VRAM、256k server 受け入れ)、起動スクリプト | 最終: 2k 73 / 32k 60 / 128k 53 / 256k 45 t/s、256k VRAM 28.5 GB、221k prompt の prefill 9 分 |
 
 ## 到達点
 
