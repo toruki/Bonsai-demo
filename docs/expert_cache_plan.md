@@ -268,3 +268,18 @@ layer 0 は他より散る(picks の 50 % / 90 % を 82 / 282 expert)。中間�
   費用(GPU 常駐の ternary-44 で同条件を測って切り分け中)。
 - VRAM peak **31.8 GB** — 上限に張り付いた。7,000 slot(13.1 GB)+ KV 6 GB + indexer 2.3 GB + ub 1024 の
   compute で余裕がない。256k では slot を 5,500 程度に落とすか、indexer KV の K-only 化(約 2 GB)が要る。
+
+### context 長と decode 速度(IQ3_XXS + cache、1 token ずつ)
+
+| context | slot | VRAM peak | decode | p95 | prefill 平均 |
+|---:|---:|---:|---:|---:|---:|
+| 2k | 8,175 | 21.6 GB | 34–37 ms(27–29 t/s) | 53–59 | 569 t/s(4k、ub 2048) |
+| 128k | 7,000 | 25.3 GB | 70.7 ms(14.2 t/s) | 108 | 205 t/s(ub 1024) |
+| 256k | 7,000 | 31.8 GB | 101 ms(9.9 t/s) | 120 | 171 t/s |
+| 256k | 4,500 | 26.5 GB | 113.8 ms(8.8 t/s) | 133 | 197 t/s |
+
+context 依存の増分は約 +0.27 ms / 1k token(256k で +67 ms)で、cache 由来(約 25–30 ms)より大きい。
+QSA / Lightning Indexer の decode 経路(indexer K cache の走査と top-2048 選択)が疑わしい。
+GPU 常駐の ternary-44 で 256k を試すと VRAM が溢れてシステムメモリに退避(prefill 5.3 時間、decode 348 ms)。
+
+host の expert tensor を cudaHostRegister で pin(`LLAMA_EXPERT_CACHE_PIN=1`)しても 36.7 → 35.3 ms と効果なし。
