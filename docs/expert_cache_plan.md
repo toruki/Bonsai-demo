@@ -347,3 +347,23 @@ GPU との往復 1 回 ≈ 35 µs。Nsight のタイムラインでは decode 1 
 64k の GPU kernel 時間は 9.8 ms/token(expert の mmvq 4.7、indexer の K gather 1.8、FA 0.3)。
 scheduler は CPU op の入出力(top-k id の D2H、slot id の H2D)ごとに数回 synchronize するので、
 host 主導の設計ではこの固定費を消せない。→ **M3(device 側の lookup + copy、同期なし)を優先**。
+
+
+## M3: device 側 lookup + fill(2026-09-26、fork commit は git log 参照)
+
+新 ggml op `GGML_OP_EXPERT_CACHE`(CUDA 実装のみ、`ggml/src/ggml-cuda/expert-cache.cu`):
+- host の expert tensor(44.2 GiB)を `cudaHostRegister(Mapped|Portable|ReadOnly)` で device から見える形に登録
+  (WSL2 でも成功)。マイクロベンチでは device kernel が mapped host memory を読む帯域 43 GB/s(cudaMemcpyAsync 47 GB/s)。
+- lookup kernel(1 block): 層ごとの固定 partition(slots/47 = 173)で LRU。hit を先に保護してから miss ごとに
+  stamp 最小の slot を退避、miss list を device に書く。fill kernel(grid k × 32 chunk): miss の 3 tensor を
+  host → bank slot にコピー。同じ stream なので後続の mul_mat_id との順序は自動、host の同期はゼロ、
+  token 全体が 1 つの CUDA graph に入る。
+- global LRU と層別 partition の hit 率差は 0.5 %(replay)。
+- 正しさ: masked QSA(決定的)で host LRU と PPL 同一(3.7755、4,000 / 8,175 slot)、常駐 slot の byte 比較
+  (`LLAMA_EXPERT_CACHE_VERIFY=300`)で不一致 0。
+- 速度(2k context、1024 token、8,175 slot): **34 → 4.15 ms/token(240 t/s)**、hit 88.3 %。
+
+### 単 token decode の非決定性
+gather 版 QSA(`LLAMA_QSA_GATHER=1`)は同一設定でも run ごとに PPL が変わる(3.8228 / 3.8171、KL 0.046):
+top-k の出力順が安定せず、attention の累積順の丸め差が MoE の routing で増幅される。masked 版は決定的
+(3.7755 が再現)。gather は既定 off に戻した(128k で −3 ms の価値しかない)。
