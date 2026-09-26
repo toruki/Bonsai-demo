@@ -523,7 +523,9 @@ VRAM peak 28,455 MiB(6,500 slot)。checkpoint は 1 個 112.6 MiB(host RAM、既
 ### prefill 高速化の調査(2026-09-27)
 
 **ubatch サイズ(32k、8,175 slot)**: ub 1024 344 t/s(この回は他プロセスの影響で遅め、通常 ~510)/ **2048: 650 t/s** /
-**4096: 760 t/s**。compute buffer 1.2 / 2.0 / 3.9 GiB、VRAM peak 24.7 / 24.4 / 26.3 GB。256k での可否は別途計測。
+**4096: 760 t/s**。compute buffer 1.2 / 2.0 / 3.9 GiB、VRAM peak 24.7 / 24.4 / 26.3 GB。
+**256k では ub 2048 は効かない**: prefill 399 t/s(ub 1024 の 421 と同等)、compute buffer 7.5 GiB、**VRAM peak 32,049 MiB(上限
+32,579)**。256k の prefill は重み転送ではなく context 比例の処理(行ごとの top-k、全長 attention)が支配的。ub 2048 は ≤128k 向け。
 
 **prefill の Nsight(32k、ub 1024、15 s 窓)**: H2D copy 244 GiB / 6.8 s(36 GiB/s、1〜5 MiB × 75k 回 = 使用 expert のみの
 コピー)、カーネル 4.0 s、**両者は全く重ならない**(union = 和)、残り 4.2 s(28 %)は起動律速(15 s で cudaLaunchKernel 758k 回、
