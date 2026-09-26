@@ -326,3 +326,7 @@ Codex(gpt-6-astra)による 256k の decode 増分(+67 ms)の分析(fork の静�
   cache の「KL 0」は byte 一致の copy だからで、これは実装の正しさの判定には attention 出力の直接比較を使う。
 - prefill 中の routing 記録 → 最初の decode で warm-up(`LLAMA_EXPERT_CACHE_WARM=1`)は、最初の 100 token で
   −4 ms/token に対して 15 GB の一括 copy が要るので既定 off。
+- gather 化の速度: 32k 37.3 → 38.1 ms(差なし)、128k 58.6 → 55.4 ms(−3 ms)。全長 KV の読み出しは
+  支配的ではなかった(FA kernel が mask 済み tile を飛ばしていたと見られる)。context 依存の +30 ms/128k の
+  正体は別(indexer の全履歴再 pooling と周辺の O(n_kv) op 群、CPU の `set_input_qsa` が候補)。64k で
+  Nsight のプロファイルを取って特定する。
