@@ -458,7 +458,12 @@ gpt-6-astra のレビュー(scratch `codex_pooled_k.md`)に沿って実装。要
 | 32k Nsight A/B(同条件・連続) | GPU busy 15.34 → 14.43 ms/token(get_rows −0.41、cont copy −0.19、bcast −0.12、norm −0.10、rope −0.06)、wall 19.28 → 17.87 |
 
 wall time の run 間ばらつきは ±1–2 ms あり(同じコードで 128k が 26.3 と 29.8 ms の日もある)、32k の A/B の初回は
-逆に +1.9 ms だった。効果はカーネル時間で判断する。128k の Nsight A/B は下に追記。
+逆に +1.9 ms だった。効果はカーネル時間で判断する。
+
+128k Nsight A/B(7,000 slot、同条件・連続、pooled off → on): **wall 27.12 → 21.56 ms/token(46 t/s)、GPU busy 21.91 → 17.93**。
+内訳: get_rows −1.64、DtoD copy −0.78、bcast −0.56、rms_norm −0.39、rope −0.22、scale −0.19、FA −0.27(ばらつき)。
+残る context 依存の GPU 時間は全長 masked FA(2.24 ms @128k)と score の cell 展開 + top-k(get_rows 1.6 ms のうち
+n_kv 行の展開分)。
 
 ### llama-server での prefix 再利用(単一 slot、65k context、expert cache 8,175 slot)
 
