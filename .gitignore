@@ -232,3 +232,5 @@ llama.cpp
 .venv-hermes/
 .agent-browser/
 agent-runs/
+tools/flash_next_ternary/dump_hidden/dump_hidden_q4x
+tools/flash_next_ternary/qsa_edit_test/qsa_edit_test
