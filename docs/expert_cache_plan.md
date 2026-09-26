@@ -387,6 +387,31 @@ llama-server / llama-cli の実測(2k、200 token 生成)も 59–65 t/s で整�
 (indexer の全履歴再 pooling と O(n_kv) の host 処理が候補)。Nsight(2k、llama-cli): GPU kernel 11.2 ms/token
 (expert mmvq 4.9、fill 3.3、quantize 1.0)、idle 5 ms。
 
+### PLE 予測 lookup の O(1) 化(2026-09-26、fork commit 44bafce31)
+
+`llama_kv_cache::get_prev_tokens()`(PLE n-gram の前 2 token を引く)が decode token ごとに使用中 cell を
+全走査していた(32k で 3.2 ms、128k で約 13 ms、256k で約 25 ms/token)。`apply_ubatch()` で直近 256 個の
+(seq, pos, token) をリングに記録し、追記 decode ではリングで解決、cell を編集する操作(seq_rm/cp/keep/add/div、
+clear、state 復元)でリングを捨てて全走査に戻す。PPL 同一(3.7755 / 3.6967)。
+
+| context | slot | prefill(pinned) | decode(M3 訂正版) | **PLE 修正後** | p95 | hit |
+|---:|---:|---:|---:|---:|---:|---:|
+| 32k | 8,175 | 581 t/s | 21.5 ms | **17.8 ms(56 t/s)** | — | 82.6 % |
+| 128k | 7,000 | 475 t/s(4.6 分) | 40.1 ms | **29.8 ms(33.6 t/s)** | 33.5 | 78.6 % |
+| 256k | 6,500 | 383 t/s(11.4 分) | 62.4 ms | **38.0 ms(26.3 t/s)** | 44.2 | 75.5 % |
+
+`LLAMA_DECODE_PROFILE=1` の段階別内訳(ms/token、単 token ubatch の平均):
+
+| context | set_inputs | うち qsa | compute launch | wait for device | 合計 |
+|---:|---:|---:|---:|---:|---:|
+| 128k | 1.15 | 1.0 | 3.3 | 24.0 | 29.8 |
+| 256k | 2.5 | 2.1 | 4.3 | 31.8 | 38.0 |
+
+残る context 依存分は GPU 側(2k の約 11 ms → 256k 32 ms、約 0.08 ms / 1k token)で、候補は indexer の全履歴
+再 pooling(`build_qsa_top_k`: 全ブロックの K を gather → 平均 → norm → RoPE を毎 token、12 層)と、その周辺の
+O(n_kv) op(score の cell 展開、mask 加算、top-k)。CPU の `set_input_qsa`(O(n_kv) の cell 走査 + 約 3.3 MiB の
+H2D)は 256k で 2.1 ms。prefill が前回より遅い(471 → 383 t/s)のは同時に走っていた解析ジョブの影響と見られ、未確認。
+
 ### llama-server での prefix 再利用(単一 slot、65k context、expert cache 8,175 slot)
 
 | リクエスト | prefill された token | 時間 |
