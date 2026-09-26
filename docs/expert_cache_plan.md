@@ -330,3 +330,20 @@ Codex(gpt-6-astra)による 256k の decode 増分(+67 ms)の分析(fork の静�
   支配的ではなかった(FA kernel が mask 済み tile を飛ばしていたと見られる)。context 依存の +30 ms/128k の
   正体は別(indexer の全履歴再 pooling と周辺の O(n_kv) op 群、CPU の `set_input_qsa` が候補)。64k で
   Nsight のプロファイルを取って特定する。
+
+### 同期 1 回の固定費(WSL2、RTX 5090、マイクロベンチ)
+
+| 操作 | 時間 |
+|---|---:|
+| cudaStreamSynchronize(空の stream) | 0.1 µs |
+| kernel 起動 + synchronize | **38 µs** |
+| 64 B の H2D / D2H(pinned)+ synchronize | **34–35 µs** |
+| 64 B pageable cudaMemcpy | 36 µs |
+| 1.88 MiB pinned H2D + synchronize | 84 µs(≈ 22 GB/s) |
+| kernel 起動のみ | 1.7 µs |
+
+GPU との往復 1 回 ≈ 35 µs。Nsight のタイムラインでは decode 1 token あたり cudaStreamSynchronize が
+305(32k)〜476(64k)回 → **12–17 ms/token** で、GPU の idle 27–29 ms/token の大半を占める。
+64k の GPU kernel 時間は 9.8 ms/token(expert の mmvq 4.7、indexer の K gather 1.8、FA 0.3)。
+scheduler は CPU op の入出力(top-k id の D2H、slot id の H2D)ごとに数回 synchronize するので、
+host 主導の設計ではこの固定費を消せない。→ **M3(device 側の lookup + copy、同期なし)を優先**。
