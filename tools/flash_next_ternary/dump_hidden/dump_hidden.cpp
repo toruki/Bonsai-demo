@@ -226,6 +226,7 @@ int main(int argc, char ** argv) {
             common_batch_add(b1, tok, pos++, {0}, true);
             const auto t0 = std::chrono::steady_clock::now();
             if (llama_decode(ctx, b1)) { LOG_ERR("decode failed\n"); return 1; }
+            llama_synchronize(ctx);          // llama_decode returns before the device finishes: time the whole token
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             llama_batch_free(b1);
             if (i >= warm) { total_ms += ms; lat.push_back(ms); ts.tokens++; } else { first_ms += ms; n_first++; }
