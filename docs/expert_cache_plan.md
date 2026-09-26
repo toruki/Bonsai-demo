@@ -465,6 +465,30 @@ wall time の run 間ばらつきは ±1–2 ms あり(同じコードで 128k �
 残る context 依存の GPU 時間は全長 masked FA(2.24 ms @128k)と score の cell 展開 + top-k(get_rows 1.6 ms のうち
 n_kv 行の展開分)。
 
+### score 展開の flat get_rows と PLE の host gather(2026-09-26、fork commits e9cb6add3 / 5ef0d8422)
+
+gpt-6-astra の次段の順位付け(scratch `codex_next.md`): #1 単要素行の get_rows を flat 化、#2 PLE の gather を
+set_input へ、その後は堅牢化・prefill へ、という判断に同意して実装。
+- `getrows.cu`: 行長 1 の get_rows(QSA の block score → cell 展開、12 層 × n_kv 行)は 1 行 1 ブロック(256 スレッド中
+  1 本だけ働く)だったのを 1 要素 1 スレッドの flat カーネルに。値は同一。
+- PLE: 27.5 GiB の host-mapped テーブルからの行 gather を graph 内の CPU op から `llm_graph_input_ple::set_input`
+  の host gather + F32 入力に。graph splits(bs=1)は 4 のまま(残りは layer 2 の CPU expert 等)。`LLAMA_PLE_HOST_GATHER=0` で旧経路。
+- KL の下限: llama-perplexity の `--kl-divergence-base` は base を量子化して保存するため、**同一構成でも Maximum KLD
+  0.000050 が出る**(Mean は 0.000000)。今日の全変更はこの下限内で logits 同一。
+
+**最終計測(2026-09-26 夜、GPU 単独、pooled K + flat get_rows + PLE host gather + 決定的 top-k)**
+
+| context | slot | prefill | decode | p95 | hit | set_inputs / launch / wait(ms) | 朝(M3 訂正版) |
+|---:|---:|---:|---:|---:|---:|---|---:|
+| 2k | 8,175 | 497 t/s | **13.6 ms(73 t/s)** | 16.9 | 87.4 % | 0.07 / 2.8 / 11.4 | 14.7 |
+| 32k | 8,175 | 509 t/s | **16.5 ms(60.5 t/s)** | 19.6 | 82.4 % | 0.07 / 2.8 / 13.0 | 21.5 |
+| 128k | 7,000 | 471 t/s(4.6 分) | **18.8 ms(53 t/s)** | 22.4 | 79.2 % | 0.18 / 2.9 / 15.7 | 40.1 |
+| 256k | 6,500 | 421 t/s(10.4 分) | **22.3 ms(44.8 t/s)** | 25.6 | 75.0 % | 0.35 / 3.1 / 19.0 | 62.4 |
+
+context 依存の増分は 0.19 → **0.034 ms / 1k token**。残りは expert の miss(fill 約 6 ms、hit 率で決まる)、expert mmvq
+(4.5 ms)、全長 masked FA(256k で約 4.5 ms)、CPU の launch(約 3 ms)。VRAM peak(256k)は再計測時に未取得(以前 28.7 GB
++ pooled 384 MiB)。
+
 ### llama-server での prefix 再利用(単一 slot、65k context、expert cache 8,175 slot)
 
 | リクエスト | prefill された token | 時間 |
