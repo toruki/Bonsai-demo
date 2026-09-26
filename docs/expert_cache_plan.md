@@ -489,6 +489,18 @@ context 依存の増分は 0.19 → **0.034 ms / 1k token**。残りは expert �
 (4.5 ms)、全長 masked FA(256k で約 4.5 ms)、CPU の launch(約 3 ms)。VRAM peak(256k)は再計測時に未取得(以前 28.7 GB
 + pooled 384 MiB)。
 
+### 堅牢化(2026-09-26 夜、ユーザー判断: decode 最適化は一区切り、運用準備へ)
+
+- **KV 編集シナリオのテスト** `tools/flash_next_ternary/qsa_edit_test/`(`q4x_eval/edit_test.sh`): hybrid(GDN)の
+  状態は `seq_rm` では巻き戻せない(recurrent の部分削除は投機デコード用の rollback 窓 `n_rs_seq` が無いと失敗する)ので、
+  llama-server の checkpoint と同じ「snapshot → 続行 → restore → 末尾 truncate → 再生」を主軸に、奇数バッチ(5)、
+  `seq_cp` → 2 sequence 同居 → `seq_keep`、7 token 刻みの prefill、256 cell / 1024 token 境界をまたぐ単 token、
+  whole-context と per-seq の state blob を網羅。**69 step すべて pooled off/on で logits hash が一致、restore 後の
+  再生も一致(fail 0)**。
+- **256k の VRAM peak**(最終コード、6,500 slot、prefill + decode 中 0.5 s サンプリング): **28,451 MiB / 32,579**、
+  実行中はほぼ一定(compute buffer は予約済み)。余裕 4.1 GB → slot は 1.88 MiB/個なので 256k でも 7,500 程度までは
+  可能(+1.9 GB)。ただし他の GPU プロセス(例: reading-resolver)と同居するなら 6,500 のまま。decode 23.3 ms(42.9 t/s)。
+
 ### llama-server での prefix 再利用(単一 slot、65k context、expert cache 8,175 slot)
 
 | リクエスト | prefill された token | 時間 |
