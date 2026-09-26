@@ -283,3 +283,20 @@ QSA / Lightning Indexer の decode 経路(indexer K cache の走査と top-2048 
 GPU 常駐の ternary-44 で 256k を試すと VRAM が溢れてシステムメモリに退避(prefill 5.3 時間、decode 348 ms)。
 
 host の expert tensor を cudaHostRegister で pin(`LLAMA_EXPERT_CACHE_PIN=1`)しても 36.7 → 35.3 ms と効果なし。
+
+## M2(2026-09-26)と長文 decode の分析
+
+- `LLAMA_EXPERT_CACHE_STAGING=1`: miss を page-locked staging(top-k 分 18.8 MiB)経由で非同期にコピーし、
+  token ごとに 1 回だけ同期 → 2k context で **34.1 → 26.7 ms/token(37.5 t/s)**、PPL 3.7755 のまま。
+  cudaHostRegister による pin は `GGML_CUDA_REGISTER_HOST` 未設定だと即 false(141 range 失敗)で、未検証。
+- CPU スレッド数(1/4/16)は ±2 ms。
+
+Codex(gpt-6-astra)による 256k の decode 増分(+67 ms)の分析(fork の静的調査):
+1. **QSA attention が全長 KV を処理している**: `build_attn_qsa()` は選択位置以外を −∞ にしたマスクで通常の
+   `build_attn_mha()` を呼ぶ(gather なし)。FA は QK を全長で計算してからマスクを足すので、256k では 6 GiB の
+   KV を 12 層ぶん読む。選択した約 2,051 セルなら 48 MiB。→ 選択 KV を gather して FA(15–30 ms/token)。
+2. **indexer が毎 decode で全履歴を再 pooling**(gather + cont + 加算 + norm + RoPE を過去の全ブロックで再実行)。
+   完成ブロックの結果を保持して増分更新に(GPU 10–25 ms + CPU `set_input_qsa` 5–10 ms)。
+3. top-k は CUDA 13.3 + CCCL 3.3 の DeviceTopK を既に使っているので優先度低。
+4. VRAM: indexer の未使用 V(1.5 GiB)、全長 score/mask の compute、prefill/decode の compute 領域管理、main KV の Q8_0(2.8 GiB)。
+推奨順: 未使用 V 削除 → QSA の gather attention → indexer の増分化 → M3(device 側 lookup、8–15 ms)→ M4。
