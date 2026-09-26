@@ -300,3 +300,16 @@ Codex(gpt-6-astra)による 256k の decode 増分(+67 ms)の分析(fork の静�
 3. top-k は CUDA 13.3 + CCCL 3.3 の DeviceTopK を既に使っているので優先度低。
 4. VRAM: indexer の未使用 V(1.5 GiB)、全長 score/mask の compute、prefill/decode の compute 領域管理、main KV の Q8_0(2.8 GiB)。
 推奨順: 未使用 V 削除 → QSA の gather attention → indexer の増分化 → M3(device 側 lookup、8–15 ms)→ M4。
+
+### warm 状態の context 依存(pin 有効、prefill 後 400 token を除いた 300 token の平均)
+
+| context | slot | prefill(ub 1024) | decode | 最初の 400 token |
+|---:|---:|---:|---:|---:|
+| 2k | 8,175 | — | 26.4 ms(37.9 t/s) | — |
+| 32k | 8,175 | 534 t/s | 37.3 ms(26.8 t/s) | 35.3 ms |
+| 128k | 7,000 | **415 t/s**(pin なしは 205 t/s) | 58.6 ms(17.1 t/s) | 57.3 ms |
+
+- context 依存の増分は約 0.25 ms / 1k token → 256k で約 90 ms/token(11 t/s)の見込み。attention / indexer 側。
+- `GGML_CUDA_REGISTER_HOST=1` で host の expert を page-lock すると、prefill(op offload が層ごとに重みを
+  GPU へ流す)も DMA になり **2 倍**速い。256k の prefill は約 12 分の見込み。
+- prefill 直後の cold cache の影響は小さい(最初の 400 token で +2 ms 程度)。
