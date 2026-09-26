@@ -530,7 +530,9 @@ VRAM peak 28,455 MiB(6,500 slot)。checkpoint は 1 個 112.6 MiB(host RAM、既
 **prefill の Nsight(32k、ub 1024、15 s 窓)**: H2D copy 244 GiB / 6.8 s(36 GiB/s、1〜5 MiB × 75k 回 = 使用 expert のみの
 コピー)、カーネル 4.0 s、**両者は全く重ならない**(union = 和)、残り 4.2 s(28 %)は起動律速(15 s で cudaLaunchKernel 758k 回、
 CPU 3.3 s)。カーネル内訳: mul_mat_q 1.43 s、**DeviceTopK 1.25 s(497,664 launch)**: QSA の top-k が行ごとに逐次呼ばれている
-(1024 行 × 12 層 × ubatch)。→ 行をまとめて 1 launch にする radix-select を実装(`k_top_k_select`、`GGML_CUDA_TOPK_BATCH=0` で旧経路)。
+(1024 行 × 12 層 × ubatch)。→ 行をまとめて 1 launch にする radix-select を実装(`k_top_k_select`、fork commit は git log 参照、`GGML_CUDA_TOPK_BATCH=0` で旧経路):
+1 行 1 thread block、64-bit packed key を float から都度生成して 8 bit × 8 pass の radix select → k 番目以上を収集。選択集合は
+per-row 版と同一(batched prefill の KL: mean 0、max は base の量子化下限)。**32k prefill 478 → 666 t/s(ub 1024、+39 %)**。
 
 **slot save/restore(llama-server `--slot-save-path`)**: 20k token の slot は 659 MiB(≈ 32 KiB/token → 220k で約 7 GB)、
 save 0.5 s、restore 0.1 s。**末尾で生成した後の保存は、短い prefix からの続きには使えない**(hybrid の状態は末尾時点のもの
