@@ -508,6 +508,11 @@ context 依存の増分は 0.19 → **0.034 ms / 1k token**。残りは expert �
 `GGML_CUDA_REGISTER_HOST=1` と CUDA 13.3 の `LD_LIBRARY_PATH` を設定、`--jinja`、`-np 1`)。追加引数はそのまま渡す
 (`--reasoning-budget 2048` など)。smoke(32k): chat は `reasoning_content` に思考が出る thinking モデル、tool 定義付き
 リクエストは native `tool_calls`(`finish_reason: tool_calls`)を返すことを確認、生成 60.9 t/s。
+**思考の制御**: このモデルの chat template は生成プロンプトを `<think>\n` で開いた状態で渡す。fork の budget sampler は
+prefill で開始タグを受け取って起動するが、budget 0 のとき直後の改行トークンを強制終了列として消費してしまい、
+`--reasoning-budget 0` が効かないバグがあった(fork commit 参照、修正済み)。修正後: `--reasoning-budget 0` で即答、
+`--reasoning-budget N` / リクエストの `reasoning_budget_tokens` で N token で打ち切り。テンプレート側で思考を切るなら
+`"chat_template_kwargs": {"enable_thinking": false}` も使える。
 
 ### 256k 受け入れテスト(llama-server、起動スクリプト、`q4x_eval/server_256k.py`)
 
