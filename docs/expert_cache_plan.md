@@ -412,6 +412,24 @@ clear、state 復元)でリングを捨てて全走査に戻す。PPL 同一(3.7
 O(n_kv) op(score の cell 展開、mask 加算、top-k)。CPU の `set_input_qsa`(O(n_kv) の cell 走査 + 約 3.3 MiB の
 H2D)は 256k で 2.1 ms。prefill が前回より遅い(471 → 383 t/s)のは同時に走っていた解析ジョブの影響と見られ、未確認。
 
+### 128k decode の Nsight 内訳(PLE 修正後、7,000 slot、284 token、27.0 ms/token)
+
+GPU busy 21.9 ms / idle 5.2 ms。上位カーネル(ms/token):
+
+| 項目 | ms/token | 内容 |
+|---|---:|---|
+| `ecache_fill_kernel` | 6.15 | expert cache の miss(47 層、hit 78.6 %、約 190 MiB/token を mapped host から読む) |
+| `mul_mat_vec_q` | 4.52 | expert / attention の行列ベクトル積 |
+| `k_get_rows_float`(grid = n_kv) | 3.16 | **indexer**: 全ブロック member の gather(r·n_blocks 行)+ score の cell 展開(n_kv 行)、12 層 × 2 |
+| `flash_attn_ext_f16` | 2.51 | **QSA の全長 masked attention**、12 層 × 0.21 ms |
+| DtoD memcpy 16 MiB × 48 | 0.80 | indexer: member slice の `ggml_cont` × 4 / 層 |
+| `k_bin_bcast` / `rms_norm` / `scale` / `rope`(grid = n_blocks) | ~1.5 | indexer: pooling の加算・norm・rope、mask 加算 |
+
+context に比例するのは indexer の再 pooling 連鎖(約 5.5 ms @128k → 約 11 ms @256k)と全長 FA(2.5 → 5 ms)で、
+合わせて 256k の 38 ms のうち約 16 ms。CPU の `set_input_qsa` は 1.0 / 2.1 ms。完成ブロックの pooled K は不変なので、
+永続テンソルに保持して新規ブロックだけ更新する「増分 pooled-K」(recent-token ring と同じ追記高速路 + cell 編集で無効化)で
+前者を消せる見込み(256k で約 38 → 28 ms)。設計は gpt-6-astra にレビュー依頼(scratch: codex_pooled_k.md)。
+
 ### llama-server での prefix 再利用(単一 slot、65k context、expert cache 8,175 slot)
 
 | リクエスト | prefill された token | 時間 |
