@@ -533,6 +533,8 @@ CPU 3.3 s)。カーネル内訳: mul_mat_q 1.43 s、**DeviceTopK 1.25 s(497,664 
 (1024 行 × 12 層 × ubatch)。→ 行をまとめて 1 launch にする radix-select を実装(`k_top_k_select`、fork commit は git log 参照、`GGML_CUDA_TOPK_BATCH=0` で旧経路):
 1 行 1 thread block、64-bit packed key を float から都度生成して 8 bit × 8 pass の radix select → k 番目以上を収集。選択集合は
 per-row 版と同一(batched prefill の KL: mean 0、max は base の量子化下限)。**32k prefill 478 → 666 t/s(ub 1024、+39 %)**。
+128k(7,000 slot): ub 1024 471 → **591 t/s**、**ub 2048 862 t/s(2.5 分、VRAM peak 26.7 GB、compute buffer 4.1 GiB)**。
+起動スクリプトは `FLASH_UB` 既定を ≤128k で 2048、それ以上で 1024 に。
 
 **slot save/restore(llama-server `--slot-save-path`)**: 20k token の slot は 659 MiB(≈ 32 KiB/token → 220k で約 7 GB)、
 save 0.5 s、restore 0.1 s。**末尾で生成した後の保存は、短い prefix からの続きには使えない**(hybrid の状態は末尾時点のもの

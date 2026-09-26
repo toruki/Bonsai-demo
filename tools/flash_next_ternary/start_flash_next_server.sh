@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # llama-server for Qwen3.8-Flash-Next (unsloth UD-IQ3_XXS) on the fork build (build-q4x) with the
 # host expert cache. Measured on an RTX 5090 (32 GB, WSL2): 2k 73 t/s, 32k 60 t/s, 128k 53 t/s,
-# 256k 45 t/s decode; prefill 420-510 t/s; peak VRAM at 256k with 6,500 slots = 28.5 GB.
+# 256k 45 t/s decode; prefill 128k 860 t/s (ub 2048), 256k ~420+ t/s; peak VRAM at 256k with 6,500 slots = 28.5 GB.
 #
 #   FLASH_CTX    context (default 262144)
 #   FLASH_SLOTS  expert cache slots (1.88 MiB each; default by context: <=32k 8175, <=128k 7000, else 6500)
+#   FLASH_UB     prefill ubatch (default 2048 up to 128k context, 1024 above: at 256k the larger compute
+#                buffer hits the VRAM limit and brings no prefill gain)
 #   FLASH_HOST / FLASH_PORT (default 127.0.0.1 / 8080)
 #   FLASH_MODEL  GGUF path
 # Any extra arguments are passed to llama-server (e.g. --reasoning-budget 2048, --alias name).
@@ -21,14 +23,18 @@ if [ -z "${FLASH_SLOTS:-}" ]; then
     fi
 fi
 
+if [ -z "${FLASH_UB:-}" ]; then
+    if [ "$CTX" -le 131072 ]; then FLASH_UB=2048; else FLASH_UB=1024; fi
+fi
+
 # page-lock the mapped expert weights: the cache fills from them at PCIe speed and prefill is 2x faster
 export GGML_CUDA_REGISTER_HOST=1
 export LD_LIBRARY_PATH=/usr/local/cuda-13.3/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 
-echo "Flash-Next: ctx $CTX, expert cache $FLASH_SLOTS slots ($(awk "BEGIN{printf \"%.1f\", $FLASH_SLOTS*1.88/1024}") GiB)"
+echo "Flash-Next: ctx $CTX, ubatch $FLASH_UB, expert cache $FLASH_SLOTS slots ($(awk "BEGIN{printf \"%.1f\", $FLASH_SLOTS*1.88/1024}") GiB)"
 
 exec "$BIN/llama-server" -m "$MODEL" \
-    -c "$CTX" -b 1024 -ub 1024 -ngl 99 -fa on \
+    -c "$CTX" -b "$FLASH_UB" -ub "$FLASH_UB" -ngl 99 -fa on \
     --expert-cache-slots "$FLASH_SLOTS" \
     -np 1 -t 4 -tb 16 \
     --jinja \
