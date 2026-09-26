@@ -557,7 +557,7 @@ E8 の `#define` と graph params の `.ecache` の 2 か所)。Bonsai-demo の 
 (84 commit、README/AGENTS/environment_variables は先方の文面をベースに `BONSAI_KV` プリセットと `BONSAI_BIN_DIR` を戻し、
 `build_cuda_linux.sh` は先方版を採用)。旧 tip は `*-pre-rebase-20260927` tag。両 branch を toruki の fork に push。
 rebase 後ビルドの検証: 単 token PPL 2.4676 / batched 2.2672(旧ビルドと同一)、pooled / PLE / batched top-k の off/on とも KL 0、
-qsa_edit_test 69 step 一致、server(chat・tool_calls)動作。速度は Nsight で rebase 前後を比較(下記)。
+qsa_edit_test 69 step 一致、server(chat・tool_calls)動作。速度: 32k decode の Nsight 比較で GPU busy 14.43 → 14.83 ms/token(+3 %、mul_mat_vec_q +0.19、fill +0.31 は miss 数の揺れ)、prefill 646 t/s — 実質同等。
 
 ### llama-server での prefix 再利用(単一 slot、65k context、expert cache 8,175 slot)
 
