@@ -386,3 +386,17 @@ llama-server / llama-cli の実測(2k、200 token 生成)も 59–65 t/s で整�
 128k 59 → 40、256k 101 → 62 ms。context 依存の増分は約 0.19 ms / 1k token で、256k では decode の約 3/4 を占める
 (indexer の全履歴再 pooling と O(n_kv) の host 処理が候補)。Nsight(2k、llama-cli): GPU kernel 11.2 ms/token
 (expert mmvq 4.9、fill 3.3、quantize 1.0)、idle 5 ms。
+
+### llama-server での prefix 再利用(単一 slot、65k context、expert cache 8,175 slot)
+
+| リクエスト | prefill された token | 時間 |
+|---|---:|---:|
+| A: 20,664 token の code prompt | 20,664 | 36.8 s(561 t/s)、生成 37.7 t/s |
+| B: A + 生成結果 + 追記(append only) | **9** | 0.4 s |
+| C: A の末尾 500 token を削って編集 | 533(checkpoint 復元) | 1.7 s |
+| D: B の prompt に戻す | 1,064(checkpoint 復元) | 2.5 s |
+
+fork の server は recurrent state の context checkpoint(112.6 MiB / 個、最大 32)を自動で作り、prefix が
+一致しない場合は最も近い checkpoint から差分だけ再処理する。コーディング用途(最初に大きな prefill、以後は
+差分 + decode)はそのまま成立する。起動例:
+`GGML_CUDA_REGISTER_HOST=1 llama-server -m <IQ3_XXS> -c 262144 -b 1024 -ub 1024 -ngl 99 --expert-cache-slots 6500 -fa on -np 1`
