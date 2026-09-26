@@ -536,7 +536,13 @@ per-row 版と同一(batched prefill の KL: mean 0、max は base の量子化�
 128k(7,000 slot): ub 1024 471 → **591 t/s**、**ub 2048 862 t/s(2.5 分、VRAM peak 26.7 GB、compute buffer 4.1 GiB)**。
 起動スクリプトは `FLASH_UB` 既定を ≤128k で 2048、それ以上で 1024 に。
 256k(6,500 slot、ub 1024): 421 → **498 t/s(8.7 分)**。伸びが小さいのは context 比例の他の処理(1024 query × 全長 attention、
-indexer score の mul_mat など)が支配的なため(Nsight で内訳を取る)。
+indexer score の mul_mat など)が支配的なため。**256k prefill の Nsight(約 200k token 時点、20 s 窓)**: カーネル 9.9 s(49 %)、
+H2D copy 305 GiB / 8.6 s(43 %、重ならない)、idle 1.5 s(launch は 34k 回まで減った)。カーネル内訳: **flash_attn_ext_f16 5.12 s
+(101 回、1 回 51 ms)** = QSA 層の masked attention が 1024 query × 全長 KV を読む(各 query の選択 cell は 2,051 個だが、mask
+方式では tile 単位でしか飛ばせない)、mul_mat_q 1.78 s、k_top_k_select 0.62 s、bcast 0.54 s、mm_ids_helper 0.48 s。
+→ 次の候補は prefill 用の gathered QSA attention(query ごとに選択 K/V を集めて FA、~51 → ~5 ms/層・ubatch の見込み、256k で
+prefill +30 % 程度)。ただし masked 版とは fp16 丸めが異なり bit 一致にはならない(decode の gather 検証では attention 出力
+relMSE 5e-9、logits では MoE 増幅で KL ~0.02)。
 
 **slot save/restore(llama-server `--slot-save-path`)**: 20k token の slot は 659 MiB(≈ 32 KiB/token → 220k で約 7 GB)、
 save 0.5 s、restore 0.1 s。**末尾で生成した後の保存は、短い prefix からの続きには使えない**(hybrid の状態は末尾時点のもの
