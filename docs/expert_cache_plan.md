@@ -509,6 +509,17 @@ context 依存の増分は 0.19 → **0.034 ms / 1k token**。残りは expert �
 (`--reasoning-budget 2048` など)。smoke(32k): chat は `reasoning_content` に思考が出る thinking モデル、tool 定義付き
 リクエストは native `tool_calls`(`finish_reason: tool_calls`)を返すことを確認、生成 60.9 t/s。
 
+### 256k 受け入れテスト(llama-server、起動スクリプト、`q4x_eval/server_256k.py`)
+
+| リクエスト | prefill された token | 時間 | 生成 |
+|---|---:|---:|---:|
+| A: 221,663 token の prompt | 221,663 | 523 s(424 t/s) | 39.6 t/s |
+| B: 追記 | 5 | 0.4 s | (EOS) |
+| C: 末尾付近を編集(checkpoint 復元 + 再 prefill) | 246 | 1.7 s | 43.7 t/s |
+| D: B の prompt に戻す | 1,092 | 3.9 s | B と同一出力 |
+
+VRAM peak 28,455 MiB(6,500 slot)。checkpoint は 1 個 112.6 MiB(host RAM、既定最大 32 個)。
+
 ### llama-server での prefix 再利用(単一 slot、65k context、expert cache 8,175 slot)
 
 | リクエスト | prefill された token | 時間 |
