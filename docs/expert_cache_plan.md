@@ -520,6 +520,22 @@ context 依存の増分は 0.19 → **0.034 ms / 1k token**。残りは expert �
 
 VRAM peak 28,455 MiB(6,500 slot)。checkpoint は 1 個 112.6 MiB(host RAM、既定最大 32 個)。
 
+### prefill 高速化の調査(2026-09-27)
+
+**ubatch サイズ(32k、8,175 slot)**: ub 1024 344 t/s(この回は他プロセスの影響で遅め、通常 ~510)/ **2048: 650 t/s** /
+**4096: 760 t/s**。compute buffer 1.2 / 2.0 / 3.9 GiB、VRAM peak 24.7 / 24.4 / 26.3 GB。256k での可否は別途計測。
+
+**prefill の Nsight(32k、ub 1024、15 s 窓)**: H2D copy 244 GiB / 6.8 s(36 GiB/s、1〜5 MiB × 75k 回 = 使用 expert のみの
+コピー)、カーネル 4.0 s、**両者は全く重ならない**(union = 和)、残り 4.2 s(28 %)は起動律速(15 s で cudaLaunchKernel 758k 回、
+CPU 3.3 s)。カーネル内訳: mul_mat_q 1.43 s、**DeviceTopK 1.25 s(497,664 launch)**: QSA の top-k が行ごとに逐次呼ばれている
+(1024 行 × 12 層 × ubatch)。→ 行をまとめて 1 launch にする radix-select を実装(`k_top_k_select`、`GGML_CUDA_TOPK_BATCH=0` で旧経路)。
+
+**slot save/restore(llama-server `--slot-save-path`)**: 20k token の slot は 659 MiB(≈ 32 KiB/token → 220k で約 7 GB)、
+save 0.5 s、restore 0.1 s。**末尾で生成した後の保存は、短い prefix からの続きには使えない**(hybrid の状態は末尾時点のもの
+だけで checkpoint は保存されない → 全再 prefill)。**prefix だけを prefill(`n_predict: 0`)して保存**すれば、restore 後に
+「prefix + 追加テキスト」は prompt_n=12 / 0.5 s で続き、prefix の直後を編集する要求も checkpoint 経由で 0.5 s。
+コードベースの長い prefix を一度作って使い回す運用に有効。
+
 ### llama-server での prefix 再利用(単一 slot、65k context、expert cache 8,175 slot)
 
 | リクエスト | prefill された token | 時間 |
