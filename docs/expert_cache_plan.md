@@ -368,14 +368,21 @@ gather 版 QSA(`LLAMA_QSA_GATHER=1`)は同一設定でも run ごとに PPL が�
 top-k の出力順が安定せず、attention の累積順の丸め差が MoE の routing で増幅される。masked 版は決定的
 (3.7755 が再現)。gather は既定 off に戻した(128k で −3 ms の価値しかない)。
 
-### M3 の context 依存(warm、pinned prefill、masked QSA)
+### M3 の context 依存(warm、pinned prefill、masked QSA)— 訂正版
 
-| context | slot | prefill | decode | p95 | hit | VRAM peak |
+**訂正**: 最初に報告した M3 の decode(2k 3.9 / 32k 6.6 / 128k 18 / 256k 34 ms)は計測ツールの誤りで、
+`llama_decode` の投入時間しか測っていなかった(同期ゼロの M3 では GPU の完了を待たない)。
+`llama_synchronize` を含めて測り直した値:
+
+| context | slot | prefill | decode(訂正後) | p95 | hit | VRAM peak |
 |---:|---:|---:|---:|---:|---:|---:|
-| 2k | 8,175 | 577 t/s | **3.9 ms(257 t/s)** | 6.0 | 87.9 % | 22.6 GB |
-| 32k | 8,175 | 581 t/s | **6.6 ms(152 t/s)** | 8.4 | 82.0 % | 23.6 GB |
-| 128k | 7,000 | 530 t/s(4.1 分) | **18.1 ms(55 t/s)** | 18.9 | 78.1 % | 24.9 GB |
-| 256k | 6,500 | 471 t/s(9.3 分) | **33.6 ms(29.8 t/s)** | 35.8 | 75.5 % | 28.7 GB |
+| 2k | 8,175 | 577 t/s | **14.7 ms(68 t/s)** | 18.8 | 87.6 % | 22.6 GB |
+| 2k | 12,000 | — | **13.1 ms(76 t/s)** | 16.3 | 92.6 % | — |
+| 32k | 8,175 | 581 t/s | **21.5 ms(46.5 t/s)** | 24.6 | 82.6 % | 23.6 GB |
+| 128k | 7,000 | 534 t/s(4.1 分) | **40.1 ms(24.9 t/s)** | 43.8 | 78.7 % | 24.9 GB |
+| 256k | 6,500 | 471 t/s(9.3 分) | **62.4 ms(16.0 t/s)** | 66.2 | 75.2 % | 28.7 GB |
 
-M1 比で decode は 32k 37 → 6.6 ms、128k 59 → 18 ms。残る context 依存分(≈ 0.11 ms / 1k token)は
-indexer の全履歴再 pooling などの O(n_kv) 処理。hit 率は context が長いほど下がる(routing が散る)。
+llama-server / llama-cli の実測(2k、200 token 生成)も 59–65 t/s で整合。M2 比で 2k 34 → 14.7、32k 37 → 21.5、
+128k 59 → 40、256k 101 → 62 ms。context 依存の増分は約 0.19 ms / 1k token で、256k では decode の約 3/4 を占める
+(indexer の全履歴再 pooling と O(n_kv) の host 処理が候補)。Nsight(2k、llama-cli): GPU kernel 11.2 ms/token
+(expert mmvq 4.9、fill 3.3、quantize 1.0)、idle 5 ms。
