@@ -501,6 +501,14 @@ context 依存の増分は 0.19 → **0.034 ms / 1k token**。残りは expert �
   実行中はほぼ一定(compute buffer は予約済み)。余裕 4.1 GB → slot は 1.88 MiB/個なので 256k でも 7,500 程度までは
   可能(+1.9 GB)。ただし他の GPU プロセス(例: reading-resolver)と同居するなら 6,500 のまま。decode 23.3 ms(42.9 t/s)。
 
+### 起動スクリプト(運用)
+
+`tools/flash_next_ternary/start_flash_next_server.sh`: fork の `build-q4x/bin/llama-server` を expert cache 付きで起動
+(`FLASH_CTX` 既定 262144、`FLASH_SLOTS` は context に応じて 8175 / 7000 / 6500、`FLASH_HOST` / `FLASH_PORT`、
+`GGML_CUDA_REGISTER_HOST=1` と CUDA 13.3 の `LD_LIBRARY_PATH` を設定、`--jinja`、`-np 1`)。追加引数はそのまま渡す
+(`--reasoning-budget 2048` など)。smoke(32k): chat は `reasoning_content` に思考が出る thinking モデル、tool 定義付き
+リクエストは native `tool_calls`(`finish_reason: tool_calls`)を返すことを確認、生成 60.9 t/s。
+
 ### llama-server での prefix 再利用(単一 slot、65k context、expert cache 8,175 slot)
 
 | リクエスト | prefill された token | 時間 |
