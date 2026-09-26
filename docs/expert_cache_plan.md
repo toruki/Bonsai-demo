@@ -367,3 +367,15 @@ host 主導の設計ではこの固定費を消せない。→ **M3(device 側�
 gather 版 QSA(`LLAMA_QSA_GATHER=1`)は同一設定でも run ごとに PPL が変わる(3.8228 / 3.8171、KL 0.046):
 top-k の出力順が安定せず、attention の累積順の丸め差が MoE の routing で増幅される。masked 版は決定的
 (3.7755 が再現)。gather は既定 off に戻した(128k で −3 ms の価値しかない)。
+
+### M3 の context 依存(warm、pinned prefill、masked QSA)
+
+| context | slot | prefill | decode | p95 | hit | VRAM peak |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2k | 8,175 | 577 t/s | **3.9 ms(257 t/s)** | 6.0 | 87.9 % | 22.6 GB |
+| 32k | 8,175 | 581 t/s | **6.6 ms(152 t/s)** | 8.4 | 82.0 % | 23.6 GB |
+| 128k | 7,000 | 530 t/s(4.1 分) | **18.1 ms(55 t/s)** | 18.9 | 78.1 % | 24.9 GB |
+| 256k | 6,500 | 420 t/s(10.4 分) | (計測中) | | 69.8 % | 28.7 GB |
+
+M1 比で decode は 32k 37 → 6.6 ms、128k 59 → 18 ms。残る context 依存分(≈ 0.11 ms / 1k token)は
+indexer の全履歴再 pooling などの O(n_kv) 処理。hit 率は context が長いほど下がる(routing が散る)。
