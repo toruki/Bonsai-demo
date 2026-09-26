@@ -313,3 +313,16 @@ Codex(gpt-6-astra)による 256k の decode 増分(+67 ms)の分析(fork の静�
 - `GGML_CUDA_REGISTER_HOST=1` で host の expert を page-lock すると、prefill(op offload が層ごとに重みを
   GPU へ流す)も DMA になり **2 倍**速い。256k の prefill は約 12 分の見込み。
 - prefill 直後の cold cache の影響は小さい(最初の 400 token で +2 ms 程度)。
+
+## 長文 decode の改善(2026-09-26)
+
+- **indexer の未使用 V を 1 要素に**(fork `0c9fcf159`): 256k で indexer KV 2,304 → 774 MiB(−1.5 GiB)。
+  batch path / 単 token path とも PPL 同一。
+- **QSA attention の gather 化**(fork、`LLAMA_QSA_GATHER`、既定 on): 単 token decode では top-k の cell だけを
+  `get_rows` で集めて(256 の倍数に −inf の行で padding)flash attention に渡す。同一入力での最初の QSA 層の
+  attention 出力は masked 版と relMSE 4.7e-9 で一致(fp16 の丸め)。
+- **MoE の数値感度**: 下流の層では MoE の top-k routing が離散的に切り替わるため、わずかな数値差が logits では
+  KL 0.02–0.06 に増幅される(batch vs 単 token: 0.057、CPU expert vs GPU: 0.042、gather vs masked: 0.017)。
+  cache の「KL 0」は byte 一致の copy だからで、これは実装の正しさの判定には attention 出力の直接比較を使う。
+- prefill 中の routing 記録 → 最初の decode で warm-up(`LLAMA_EXPERT_CACHE_WARM=1`)は、最初の 100 token で
+  −4 ms/token に対して 15 GB の一括 copy が要るので既定 off。
