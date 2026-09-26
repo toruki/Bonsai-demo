@@ -430,6 +430,36 @@ context に比例するのは indexer の再 pooling 連鎖(約 5.5 ms @128k →
 永続テンソルに保持して新規ブロックだけ更新する「増分 pooled-K」(recent-token ring と同じ追記高速路 + cell 編集で無効化)で
 前者を消せる見込み(256k で約 38 → 28 ms)。設計は gpt-6-astra にレビュー依頼(scratch: codex_pooled_k.md)。
 
+### 増分 pooled-K と決定的 top-k(2026-09-26、fork commits 6c7ff9fc4 / 323accbe4 / 9567b3609)
+
+gpt-6-astra のレビュー(scratch `codex_pooled_k.md`)に沿って実装。要点:
+- **永続 pooled K**(`llama_memory_hybrid_idx::pooled`): QSA 層ごとに F32 [128, kv_size/r + 2] を indexer K と同じ
+  buffer type に確保(256k で 384 MiB)。完成ブロックの pooled K(norm・rope 後)は member 4 cell と block 位置だけで
+  決まるので不変。単 token 追記(fast path)は「その token で完成するブロック」と「末尾が写像される spare ブロック
+  (full path と同じく cell 0 ×4・位置 0 から作る)」の 2 行だけを pool → `ggml_set_rows` → 保存行の view に対して
+  score。`set_input_qsa` の O(n_kv) 走査も省き、cell_blk は host 側の写しを差分更新、bias は n_bid / spare / -inf。
+- **有効条件**(Codex A): stream 1 本、1 sequence が位置 0..n-1 を隙間なく占め、ranked(mrope 画像)でなく、
+  full path が最後に記録したレイアウトと indexer cache の `edit_gen` が一致し、追記位置が n_bid·r + tail と一致する
+  text token 1 個。full path は毎回レイアウトを検証して記録し(2D/複数 seq/gap があれば無効)、全行を書き戻すので
+  prefill 直後の最初の decode から fast path に入る。cell 編集(seq_rm/cp/keep/add/div、clear、state 復元)は
+  `recent_clear()` と同じ場所で `edit_gen` を進めるので、1 ubatch だけ full path に戻って復帰する。
+- `prepare()` の投機的 `apply_ubatch()` が recent ring に入っていた(PLE 修正の取りこぼし)のも併せて修正。
+- **決定的 top-k**(`ggml/src/ggml-cuda/top-k.cu`): CUB DeviceTopK は同値の要素を任意に選ぶ。QSA は block score を
+  4 cell に展開するため cutoff(2051 − tail)が 4 回に 3 回同点になり、**同じリクエストでも run ごとに生成が変わって
+  いた**(llama-server、temp 0、20k prompt で確認)。score の順序保存ビットと index の補数を 64-bit key に詰めて
+  `MaxKeys` で選ぶ(同点は index 小が勝つ)。
+
+検証:
+| テスト | 結果 |
+|---|---|
+| 単 token PPL、4 × 512(cutoff なし)、pooled off を base に on の KL | **KL 0.000000、PPL 同一(2.4676)**、決定的 top-k でも同一 |
+| 8k context、decode 6 token、中間テンソル dump | layer 3(最初の QSA 層)の block score は有効行で bit 一致、top-k 集合は 6 token すべて一致。差は -inf でマスクされる未使用行のみ。後段の差は旧 top-k の同点選択によるもの |
+| llama-server、20k prompt → 追記 → checkpoint 復元 + 途中編集 → 追記(5 リクエスト、temp 0) | 旧 top-k: off 同士でも run ごとに B/E が変化。**決定的 top-k: on×2 と off がすべて同一** |
+| 32k Nsight A/B(同条件・連続) | GPU busy 15.34 → 14.43 ms/token(get_rows −0.41、cont copy −0.19、bcast −0.12、norm −0.10、rope −0.06)、wall 19.28 → 17.87 |
+
+wall time の run 間ばらつきは ±1–2 ms あり(同じコードで 128k が 26.3 と 29.8 ms の日もある)、32k の A/B の初回は
+逆に +1.9 ms だった。効果はカーネル時間で判断する。128k の Nsight A/B は下に追記。
+
 ### llama-server での prefix 再利用(単一 slot、65k context、expert cache 8,175 slot)
 
 | リクエスト | prefill された token | 時間 |
