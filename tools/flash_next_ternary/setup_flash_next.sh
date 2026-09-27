@@ -19,10 +19,14 @@ else
     git -C "$TARGET/llama.cpp" fetch -q origin "$BRANCH" && git -C "$TARGET/llama.cpp" checkout -q "$BRANCH" && git -C "$TARGET/llama.cpp" pull -q --ff-only
 fi
 
-NVCC=$(command -v nvcc || ls -d /usr/local/cuda*/bin/nvcc 2>/dev/null | sort -V | tail -1 || true)
+# prefer a toolkit directory (/usr/local/cuda-X.Y) over a bare nvcc symlink in /usr/local/bin, and resolve symlinks
+NVCC=$(ls -d /usr/local/cuda*/bin/nvcc 2>/dev/null | sort -V | tail -1 || true)
+[ -n "$NVCC" ] || NVCC=$(command -v nvcc || true)
 [ -n "$NVCC" ] || { echo "nvcc not found"; exit 1; }
+NVCC=$(readlink -f "$NVCC")
 
 CUDA_ROOT=$(cd "$(dirname "$NVCC")/.." && pwd)
+echo "using CUDA toolkit at $CUDA_ROOT"
 export PATH="$CUDA_ROOT/bin:$PATH"
 
 cd "$TARGET/llama.cpp"
