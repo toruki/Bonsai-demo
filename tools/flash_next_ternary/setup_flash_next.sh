@@ -22,9 +22,12 @@ fi
 NVCC=$(command -v nvcc || ls -d /usr/local/cuda*/bin/nvcc 2>/dev/null | sort -V | tail -1 || true)
 [ -n "$NVCC" ] || { echo "nvcc not found"; exit 1; }
 
+CUDA_ROOT=$(cd "$(dirname "$NVCC")/.." && pwd)
+export PATH="$CUDA_ROOT/bin:$PATH"
+
 cd "$TARGET/llama.cpp"
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$ARCH" \
-      -DCMAKE_CUDA_COMPILER="$NVCC" -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+      -DCMAKE_CUDA_COMPILER="$NVCC" -DCUDAToolkit_ROOT="$CUDA_ROOT" -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
       > build-configure.log 2>&1 || { tail -20 build-configure.log; exit 1; }
 cmake --build build -j"$(nproc)" --target llama-server llama-cli llama-perplexity > build-build.log 2>&1 || { grep -E "error" build-build.log | head; exit 1; }
 echo "built: $TARGET/llama.cpp/build/bin ($(git rev-parse --short HEAD), arch $ARCH)"
