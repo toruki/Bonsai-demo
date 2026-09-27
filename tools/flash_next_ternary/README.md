@@ -1,3 +1,6 @@
+> **Moved**: the Flash-Next runtime work now lives in its own repository at `~/AI/LLM/flash-next`
+> (scripts/, tools/, tests/, docs/). The copies here are kept for the history of this branch.
+
 # Flash-Next on the fork — build and run
 
 Qwen3.8-Flash-Next (unsloth `UD-IQ3_XXS` GGUF, used as published, no conversion) on branch `flash-next` of
