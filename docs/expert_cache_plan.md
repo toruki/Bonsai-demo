@@ -564,6 +564,14 @@ E8 の `#define` と graph params の `.ecache` の 2 か所)。Bonsai-demo の 
 rebase 後ビルドの検証: 単 token PPL 2.4676 / batched 2.2672(旧ビルドと同一)、pooled / PLE / batched top-k の off/on とも KL 0、
 qsa_edit_test 69 step 一致、server(chat・tool_calls)動作。速度: 32k decode の Nsight 比較で GPU busy 14.43 → 14.83 ms/token(+3 %、mul_mat_vec_q +0.19、fill +0.31 は miss 数の揺れ)、prefill 646 t/s — 実質同等。
 
+### 別の場所での再構築(2026-09-27)
+
+`tools/flash_next_ternary/setup_flash_next.sh <dir> [arch]` で toruki fork の `qwen4exp-port` を clone → CUDA ビルド。
+`/data/eval/flash-next-rebuild` にクリーン clone してビルド(3ce1be85b、120a)し、`FLASH_BIN_DIR` 指定の起動スクリプトで
+chat / tool_calls の動作と、in-tree ビルドに対する KL 0 を確認。手順は `tools/flash_next_ternary/README.md`。
+CMake の CUDA 検出はツールキットのディレクトリ(`/usr/local/cuda-X.Y`)を渡す必要がある(`/usr/local/bin/nvcc` の
+symlink だけでは `CUDA Toolkit not found`)。
+
 ### llama-server での prefix 再利用(単一 slot、65k context、expert cache 8,175 slot)
 
 | リクエスト | prefill された token | 時間 |

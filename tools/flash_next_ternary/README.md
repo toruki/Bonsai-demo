@@ -1,30 +1,25 @@
-# flash_next_ternary
+# Flash-Next on the fork — build and run
 
-Qwen3.8-Flash-Next へ Bonsai 2 風の ternary 量子化を適用できるかを調べるための
-実験コード。**既存の Bonsai 2 / Qwen3.8-27B 推論環境には一切触れません。**
-`llama.cpp/` も `models/` も読むだけです。
+Qwen3.8-Flash-Next (unsloth `UD-IQ3_XXS` GGUF, used as published, no conversion) on the PrismML llama.cpp fork
+branch `qwen4exp-port` (github.com/toruki/llama.cpp) with the host expert cache. Verified on one machine: RTX 5090
+32 GB, WSL2, CUDA 13.3, compute capability 12.0 (`120a`). Only the CUDA backend has the expert cache and the batched top-k.
 
-| ファイル | 役割 |
-|---|---|
-| `bonsai_format.py` | PQ2_0 / PTQ1_0 codec と Hadamard 回転 / fold の numpy 転記。出荷 GGUF に対する byte 一致 selftest 付き |
-| `fetch_slice.py` | HF safetensors から必要な tensor(行スライス)だけ HTTP Range 取得。キャッシュは `/data/models/flash-next-bf16-slices` |
-| `ternary_quant.py` | group-wise ternary 量子化 4 方式(A: absmean / B: MSE scale / C: threshold grid / D: 交互反復) |
-| `run_phase3.py` | 単一 tensor の測定ハーネス |
-| `bonsai_reverse.py` | 出荷 Bonsai 2 の code/scale を base Qwen3.8-27B と要素対応させ、fold 規約・threshold・scale を逆算 |
+1. Build into any directory (clones the fork branch, configures with CUDA, builds llama-server/llama-cli/llama-perplexity):
 
-## 使い方
+       tools/flash_next_ternary/setup_flash_next.sh /path/to/dir 120a
 
-```bash
-# 前提: numpy / requests / huggingface-hub / pyyaml が入った venv
-python tools/flash_next_ternary/bonsai_format.py \
-    models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-PQ2_0.gguf      # selftest
+2. Get the model: `huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF`, folder `UD-IQ3_XXS/` (3 files, ~30 GB).
 
-python tools/flash_next_ternary/run_phase3.py --part gate --expert 0
-python tools/flash_next_ternary/run_phase3.py --part down --expert 0 --blocks 0 128
-```
+3. Run:
 
-```bash
-python tools/flash_next_ternary/bonsai_reverse.py --layer 0 --tensor 'blk.{l}.ffn_gate.weight' --rows 1024
-```
+       FLASH_BIN_DIR=/path/to/dir/llama.cpp/build/bin FLASH_MODEL=/path/to/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
+       FLASH_CTX=131072 tools/flash_next_ternary/start_flash_next_server.sh [--reasoning-budget 2048 ...]
 
-結果と考察は `docs/phase3_ternary_experiment.md` と `docs/bonsai_reverse_analysis.md`。
+   `FLASH_CTX` (default 262144), `FLASH_SLOTS` (expert cache slots, 1.88 MiB each; default 8175 / 7000 / 6500 by context),
+   `FLASH_UB` (2048 up to 128k, 1024 above), `FLASH_HOST` / `FLASH_PORT`. Extra arguments go to llama-server.
+   Peak VRAM at 256k with 6,500 slots is 28.5 GB; keep other GPU processes off while running.
+
+4. Check (optional): `q4x_eval`-style tests live in `qsa_edit_test/` (KV edits) and the KL recipe in docs/expert_cache_plan.md.
+
+Measured (this machine): decode 2k 73 t/s, 32k 60, 128k 53, 256k 45 t/s; prefill 128k 862 t/s (ub 2048), 256k 498 t/s.
+Details and history: docs/expert_cache_plan.md.
