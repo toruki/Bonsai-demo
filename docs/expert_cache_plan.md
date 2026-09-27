@@ -585,6 +585,8 @@ upstream が #28040 で位置索引化済み)。競合は M1 の graph params(`p
 2.4676 → 2.4360、KL 平均 0.04)。512 context では upstream の sparse-FA は発動しない(KV ≥ 4096 が条件)ので原因は
 upstream の他のカーネル変更。CPU バックエンドを参照にすると GPU 版は upstream / fork とも KL ≈ 0.07(MoE の数値感度
 で GPU/CPU 差はこの程度)で、PPL は upstream の方が CPU に近い(3.714 vs 3.776、CPU 3.700)→ 問題なしと判断。
+upstream 側で融合(`GGML_CUDA_DISABLE_FUSION`)や CUDA graph を切っても fork との KL は 0.040 のまま(PPL 2.436 → 2.450)なので、
+差の出所は融合ではなく他のカーネル/アルゴリズム変更(8/25 → 9/26 の upstream)。
 upstream は qwen4exp の QSA に sparse-FA(#28770 / #29298、KV ≥ 4096 で有効)を持つので、長 context の prefill/decode は
 今後こちらで測り直す。
 
