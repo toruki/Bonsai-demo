@@ -1,7 +1,9 @@
 # Flash-Next on the fork — build and run
 
-Qwen3.8-Flash-Next (unsloth `UD-IQ3_XXS` GGUF, used as published, no conversion) on the PrismML llama.cpp fork
-branch `qwen4exp-port` (github.com/toruki/llama.cpp) with the host expert cache. Verified on one machine: RTX 5090
+Qwen3.8-Flash-Next (unsloth `UD-IQ3_XXS` GGUF, used as published, no conversion) on branch `flash-next` of
+github.com/toruki/llama.cpp = upstream ggml-org llama.cpp master + the runtime work (expert cache, pooled indexer
+keys, deterministic/batched top-k, PLE host gather, reasoning-budget fix). `qwen4exp-port` is the older branch on
+the PrismML fork with the same features. Verified on one machine: RTX 5090
 32 GB, WSL2, CUDA 13.3, compute capability 12.0 (`120a`). Only the CUDA backend has the expert cache and the batched top-k.
 
 1. Build into any directory (clones the fork branch, configures with CUDA, builds llama-server/llama-cli/llama-perplexity):

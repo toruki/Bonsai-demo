@@ -14,8 +14,13 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-# FLASH_BIN_DIR: directory holding llama-server (default: the fork checkout next to this repo, build-q4x)
-BIN=${FLASH_BIN_DIR:-$ROOT/llama.cpp/build-q4x/bin}
+# FLASH_BIN_DIR: directory holding llama-server. Default: the upstream-based flash-next build next to this
+# repo's parent (../flash-next/llama.cpp/build/bin), else the PrismML-fork build inside this repo (build-q4x)
+if [ -z "${FLASH_BIN_DIR:-}" ]; then
+    if [ -x "$ROOT/../flash-next/llama.cpp/build/bin/llama-server" ]; then FLASH_BIN_DIR=$ROOT/../flash-next/llama.cpp/build/bin
+    else FLASH_BIN_DIR=$ROOT/llama.cpp/build-q4x/bin; fi
+fi
+BIN=$FLASH_BIN_DIR
 [ -x "$BIN/llama-server" ] || { echo "llama-server not found in $BIN (set FLASH_BIN_DIR)"; exit 1; }
 MODEL=${FLASH_MODEL:-/data/models/qwen3.8-flash-next/hf-cache/hub/models--unsloth--Qwen3.8-Flash-Next-GGUF/snapshots/c8b5954a88c2775c546b92593eda40ea041d3176/UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf}
 CTX=${FLASH_CTX:-262144}

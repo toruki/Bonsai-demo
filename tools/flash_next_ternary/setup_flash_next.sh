@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build the Flash-Next fork (branch qwen4exp-port of toruki/llama.cpp) into a directory of your choice.
+# Build the Flash-Next branch (flash-next of toruki/llama.cpp = upstream ggml-org master + the runtime work)
+# into a directory of your choice. FLASH_BRANCH=qwen4exp-port selects the older PrismML-fork-based branch.
 #   usage: setup_flash_next.sh <target-dir> [cuda-arch]      (default arch 120a = RTX 5090)
 # Result: <target-dir>/llama.cpp/build/bin/llama-server; run it with
 #   FLASH_BIN_DIR=<target-dir>/llama.cpp/build/bin tools/flash_next_ternary/start_flash_next_server.sh
@@ -10,7 +11,7 @@ set -euo pipefail
 TARGET=${1:?target directory}
 ARCH=${2:-120a}
 REPO=${FLASH_REPO:-git@github.com:toruki/llama.cpp.git}
-BRANCH=${FLASH_BRANCH:-qwen4exp-port}
+BRANCH=${FLASH_BRANCH:-flash-next}
 
 mkdir -p "$TARGET"
 if [ ! -d "$TARGET/llama.cpp/.git" ]; then

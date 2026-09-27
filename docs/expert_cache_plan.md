@@ -572,6 +572,22 @@ chat / tool_calls の動作と、in-tree ビルドに対する KL 0 を確認。
 CMake の CUDA 検出はツールキットのディレクトリ(`/usr/local/cuda-X.Y`)を渡す必要がある(`/usr/local/bin/nvcc` の
 symlink だけでは `CUDA Toolkit not found`)。
 
+### upstream ggml-org master ベースへの移行(2026-09-27、branch `flash-next`)
+
+PrismML fork 固有の機能は Flash-Next では使っていないので、runtime 変更 16 commit(expert cache M1–M3、indexer V 縮小、
+QSA gather、decode profile、`edit_gen`、pooled K、決定的/batched top-k、flat get_rows、PLE host gather、reasoning-budget
+修正)を upstream master(2b129ccfa、9/26)に cherry-pick(移植 commit・E8 KV・PLE リングは除外。PLE の前 token 参照は
+upstream が #28040 で位置索引化済み)。競合は M1 の graph params(`prec_policy` 形式)、CMake、profile 1 行、`edit_gen`
+(cell 編集 7 か所に bump を追加)、`build_attn_mha` の `n_kv_max` 引数、`n_expert_used_max()`。場所は
+`~/AI/LLM/flash-next/llama.cpp`、`toruki/llama.cpp` の `flash-next` に push。
+検証: ビルド内の pooled / batched top-k off/on KL 0、qsa_edit_test 69 step 一致、server chat / tool_calls、
+2k 15.6 / 32k 18.2 / 128k 18.9 ms、128k prefill 739 t/s(ub 2048)。**fork ビルドとは logits が一致しない**(単 token PPL
+2.4676 → 2.4360、KL 平均 0.04)。512 context では upstream の sparse-FA は発動しない(KV ≥ 4096 が条件)ので原因は
+upstream の他のカーネル変更。CPU バックエンドを参照にすると GPU 版は upstream / fork とも KL ≈ 0.07(MoE の数値感度
+で GPU/CPU 差はこの程度)で、PPL は upstream の方が CPU に近い(3.714 vs 3.776、CPU 3.700)→ 問題なしと判断。
+upstream は qwen4exp の QSA に sparse-FA(#28770 / #29298、KV ≥ 4096 で有効)を持つので、長 context の prefill/decode は
+今後こちらで測り直す。
+
 ### llama-server での prefix 再利用(単一 slot、65k context、expert cache 8,175 slot)
 
 | リクエスト | prefill された token | 時間 |
