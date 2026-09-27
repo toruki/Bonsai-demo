@@ -587,8 +587,9 @@ upstream の他のカーネル変更。CPU バックエンドを参照にする�
 で GPU/CPU 差はこの程度)で、PPL は upstream の方が CPU に近い(3.714 vs 3.776、CPU 3.700)→ 問題なしと判断。
 upstream 側で融合(`GGML_CUDA_DISABLE_FUSION`)や CUDA graph を切っても fork との KL は 0.040 のまま(PPL 2.436 → 2.450)なので、
 差の出所は融合ではなく他のカーネル/アルゴリズム変更(8/25 → 9/26 の upstream)。
-upstream は qwen4exp の QSA に sparse-FA(#28770 / #29298、KV ≥ 4096 で有効)を持つので、長 context の prefill/decode は
-今後こちらで測り直す。
+upstream は qwen4exp の QSA に sparse-FA(#28770 / #29298、KV ≥ 4096 で有効)を持つ。**256k(6,500 slot、ub 1024)の実測:
+prefill 556 t/s(7.8 分、fork 498)、decode 20.6 ms/token(48.5 t/s、fork 22.3)、VRAM peak 28.8 GB** — 全長 masked attention の
+分が sparse-FA で減った(bit 一致の方針のまま upstream 側の実装で得られた改善)。
 
 ### llama-server での prefix 再利用(単一 slot、65k context、expert cache 8,175 slot)
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # llama-server for Qwen3.8-Flash-Next (unsloth UD-IQ3_XXS) on the fork build (build-q4x) with the
 # host expert cache. Measured on an RTX 5090 (32 GB, WSL2): 2k 73 t/s, 32k 60 t/s, 128k 53 t/s,
-# 256k 45 t/s decode; prefill 128k 860 t/s (ub 2048), 256k ~420+ t/s; peak VRAM at 256k with 6,500 slots = 28.5 GB.
+# 256k 48 t/s decode (flash-next build); prefill 128k ~740-860 t/s (ub 2048), 256k 556 t/s; peak VRAM at 256k
+# with 6,500 slots = 28.8 GB.
 #
 #   FLASH_CTX    context (default 262144)
 #   FLASH_SLOTS  expert cache slots (1.88 MiB each; default by context: <=32k 8175, <=128k 7000, else 6500)
