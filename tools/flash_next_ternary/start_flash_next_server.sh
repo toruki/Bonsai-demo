@@ -9,11 +9,14 @@
 #                buffer hits the VRAM limit and brings no prefill gain)
 #   FLASH_HOST / FLASH_PORT (default 127.0.0.1 / 8080)
 #   FLASH_MODEL  GGUF path
+#   FLASH_BIN_DIR directory with llama-server (default llama.cpp/build-q4x/bin under this repo)
 # Any extra arguments are passed to llama-server (e.g. --reasoning-budget 2048, --alias name).
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-BIN="$ROOT/llama.cpp/build-q4x/bin"
+# FLASH_BIN_DIR: directory holding llama-server (default: the fork checkout next to this repo, build-q4x)
+BIN=${FLASH_BIN_DIR:-$ROOT/llama.cpp/build-q4x/bin}
+[ -x "$BIN/llama-server" ] || { echo "llama-server not found in $BIN (set FLASH_BIN_DIR)"; exit 1; }
 MODEL=${FLASH_MODEL:-/data/models/qwen3.8-flash-next/hf-cache/hub/models--unsloth--Qwen3.8-Flash-Next-GGUF/snapshots/c8b5954a88c2775c546b92593eda40ea041d3176/UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf}
 CTX=${FLASH_CTX:-262144}
 if [ -z "${FLASH_SLOTS:-}" ]; then
